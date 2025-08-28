@@ -55,36 +55,37 @@ class RetrievalDataset(Dataset):
                 all_pos_premises = get_all_pos_premises(
                     tac["annotated_tactic"], self.corpus
                 )
+                # BIG TODO: try all, the graph of signatures' premises and proofs' premises and both?
+                before_premises_names = set()
+                if "before_premises" in tac and tac["before_premises"]: # TODO: do we need only the first goal, or all?
+                    for context_premises, goal_premises in tac["before_premises"]:
+                        for p in context_premises:
+                            if p and p.get("fullName"):
+                                before_premises_names.add(p["fullName"])
+                        for p in goal_premises:
+                            if p and p.get("fullName"):
+                                before_premises_names.add(p["fullName"])
+
+                base_example = {
+                    "url": thm["url"],
+                    "commit": thm["commit"],
+                    "file_path": thm["file_path"],
+                    "full_name": thm["full_name"],
+                    "start": thm["start"],
+                    "tactic_idx": i,
+                    "context": context,
+                    "all_pos_premises": all_pos_premises,
+                    "before_premises": list(before_premises_names),
+                }
 
                 if self.is_train:
                     # In training, we ignore tactics that do not have any premises.
                     for pos_premise in all_pos_premises:
-                        data.append(
-                            {
-                                "url": thm["url"],
-                                "commit": thm["commit"],
-                                "file_path": thm["file_path"],
-                                "full_name": thm["full_name"],
-                                "start": thm["start"],
-                                "tactic_idx": i,
-                                "context": context,
-                                "pos_premise": pos_premise,
-                                "all_pos_premises": all_pos_premises,
-                            }
-                        )
+                        ex = base_example.copy()
+                        ex["pos_premise"] = pos_premise
+                        data.append(ex)
                 else:
-                    data.append(
-                        {
-                            "url": thm["url"],
-                            "commit": thm["commit"],
-                            "file_path": thm["file_path"],
-                            "full_name": thm["full_name"],
-                            "start": thm["start"],
-                            "tactic_idx": i,
-                            "context": context,
-                            "all_pos_premises": all_pos_premises,
-                        }
-                    )
+                    data.append(base_example)
 
         logger.info(f"Loaded {len(data)} examples.")
         return data

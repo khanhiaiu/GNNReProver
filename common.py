@@ -1,3 +1,4 @@
+import collections
 import os
 import re
 import sys
@@ -10,6 +11,7 @@ from loguru import logger
 from lean_dojo import Pos
 import pytorch_lightning as pl
 from dataclasses import dataclass, field
+from torch_geometric.data import Data
 from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict,
 )
@@ -17,6 +19,7 @@ from transformers import get_constant_schedule_with_warmup
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from typing import Optional, List, Dict, Any, Tuple, Generator
 from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
+from tqdm import tqdm
 
 
 Example = Dict[str, Any]
@@ -78,6 +81,10 @@ class Premise:
 
     code: str = field(compare=False)
     """Raw, human-written code for defining the premise.
+    """
+
+    dependencies: List[str] = field(compare=False, default_factory=list)
+    """A list of premises this premise depends on.
     """
 
     def __post_init__(self) -> None:
@@ -167,7 +174,8 @@ class File:
                 continue
             premises.append(
                 Premise(
-                    path, p["full_name"], Pos(*p["start"]), Pos(*p["end"]), p["code"]
+                    path, p["full_name"], Pos(*p["start"]), Pos(*p["end"]), p["code"],
+                    p.get("dependencies", []),
                 )
             )
         return cls(path, premises)
@@ -191,32 +199,76 @@ class Corpus:
     all_premises: List[Premise]
     """All premises in the entire corpus.
     """
+    premise_dep_graph: Data
+    uid2idx: Dict[Tuple[str, int, int], int]
 
     def __init__(self, jsonl_path: str) -> None:
         """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
         dep_graph = nx.DiGraph()
-        self.all_premises = []
-
+        
         logger.info(f"Building the corpus from {jsonl_path}")
 
+        # ======================== START OF ROBUST MERGING FIX ========================
+        
+        # Step 1: Ingest all data, building the file graph and collecting all premises.
+        all_premises_with_duplicates = []
         for line in open(jsonl_path):
             file_data = json.loads(line)
             path = file_data["path"]
             assert not dep_graph.has_node(path)
-            file = File.from_data(file_data)
+            
+            if not dep_graph.has_node(path):
+                file = File.from_data(file_data)
+                dep_graph.add_node(path, file=file)
+                all_premises_with_duplicates.extend(file.premises)
 
-            dep_graph.add_node(path, file=file)
-            self.all_premises.extend(file.premises)
-
-            for p in file_data["imports"]:
-                assert dep_graph.has_node(p)
-                dep_graph.add_edge(path, p)
-
+            for p_import in file_data["imports"]:
+                # The node may not exist yet if the corpus.jsonl is not topologically sorted.
+                if not dep_graph.has_node(p_import):
+                    dep_graph.add_node(p_import, file=None) # Add a placeholder
+                dep_graph.add_edge(path, p_import)
+        
+        # Step 2: Deduplicate premises using a "last-one-wins" strategy.
+        # This creates a canonical mapping from each name to a single Premise object.
+        unique_premises_dict = {p.full_name: p for p in all_premises_with_duplicates}
+        
+        # Step 3: The final, canonical list of premises is the values of this dict.
+        # This list is guaranteed to have unique premises by full_name.
+        self.all_premises = list(unique_premises_dict.values())
+        
+        # ========================= END OF ROBUST MERGING FIX =========================
         assert nx.is_directed_acyclic_graph(dep_graph)
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
 
+        self.name2idx = {p.full_name: i for i, p in enumerate(self.all_premises)}
+        self._build_premise_dependency_graph()
+
         self.imported_premises_cache = {}
         self.fill_cache()
+
+    def _build_premise_dependency_graph(self) -> None:
+        logger.info("Building the premise dependency graph.")
+        edges = []
+        
+        # We now iterate over the original dictionary of unique premises to access dependencies.
+        # This ensures we use the dependency list from the canonical premise object.
+        unique_premises_dict = {p.full_name: p for p in self.all_premises}
+
+        for p1_name, p1 in unique_premises_dict.items():
+            if p1_name not in self.name2idx: continue
+            p1_idx = self.name2idx[p1_name]
+            
+            for p2_name in p1.dependencies:
+                # If a dependency exists in our canonical mapping, create an edge.
+                if p2_name in self.name2idx:
+                    p2_idx = self.name2idx[p2_name]
+                    # Avoid self-loops.
+                    if p1_idx != p2_idx:
+                        edges.append((p2_idx, p1_idx))
+
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        self.premise_dep_graph = Data(edge_index=edge_index, num_nodes=len(self.all_premises))
+        logger.info(f"Premise dependency graph: {self.premise_dep_graph}")
 
     def _get_file(self, path: str) -> File:
         return self.transitive_dep_graph.nodes[path]["file"]

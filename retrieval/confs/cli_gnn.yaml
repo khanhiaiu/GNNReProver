@@ -1,0 +1,45 @@
+seed_everything: 3407
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  strategy:
+    class_path: pytorch_lightning.strategies.DeepSpeedStrategy
+    init_args:
+      stage: 2
+      offload_optimizer: false
+      cpu_checkpointing: false
+  logger:
+    class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      project: reprover-gnn
+      name: gnn_retriever1
+      save_dir: "lightning_logs/gnn_retriever"
+  gradient_clip_val: 1.0
+  max_steps: 200000
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        verbose: true
+        save_top_k: 1
+        save_last: true
+        monitor: loss_train_epoch
+        mode: min
+
+model:
+  feature_size: 1472
+  gnn_hidden_size: 768
+  num_layers: 2
+  lr: 1e-4
+  warmup_steps: 1000
+
+data:
+  data_path: data/leandojo_benchmark_4/random/
+  corpus_path: data/leandojo_benchmark_4/corpus.jsonl
+  embeddings_path: data/leandojo_benchmark_4/embeddings/premise_embeddings.pt # IMPORTANT: Set this path
+  retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
+  num_negatives: 3
+  num_in_file_negatives: 1
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
