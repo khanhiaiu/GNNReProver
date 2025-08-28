@@ -9,7 +9,7 @@ from lean_dojo import Pos
 from loguru import logger
 import pytorch_lightning as pl
 import torch.nn.functional as F
-from typing import List, Dict, Any, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple, Union
 from transformers import AutoModelForTextEncoding, AutoTokenizer
 
 from common import (
@@ -21,6 +21,7 @@ from common import (
     zip_strict,
     cpu_checkpointing_enabled,
 )
+from retrieval.gnn_model import GNNRetriever
 
 
 torch.set_float32_matmul_precision("medium")
@@ -44,6 +45,8 @@ class PremiseRetriever(pl.LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModelForTextEncoding.from_pretrained(model_name)
         self.embeddings_staled = True
+
+        self.gnn_model: Optional[GNNRetriever] = None
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "PremiseRetriever":
@@ -93,6 +96,9 @@ class PremiseRetriever(pl.LightningModule):
         self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor
     ) -> torch.FloatTensor:
         """Encode a premise or a context into a feature vector."""
+        logger.debug(f"PremiseRetriever._encode called. encoder.device: {self.encoder.device}")
+        logger.debug(f"Input_ids device: {input_ids.device}")
+        logger.debug(f"Attention_mask device: {attention_mask.device}")
         if cpu_checkpointing_enabled(self):
             hidden_states = torch.utils.checkpoint.checkpoint(
                 self.encoder, input_ids, attention_mask, use_reentrant=False
@@ -279,7 +285,30 @@ class PremiseRetriever(pl.LightningModule):
         self.predict_step_outputs = []
 
     def predict_step(self, batch: Dict[str, Any], _):
-        context_emb = self._encode(batch["context_ids"], batch["context_mask"])
+        if self.gnn_model is not None:
+            # DYNAMIC GNN-AWARE RETRIEVAL
+            # 1. Get initial context embedding from the text encoder.
+            initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
+
+            # 2. Prepare neighbor indices from `before_premises`.
+            batch_neighbor_indices = []
+            for before_premises_list in batch["before_premises"]:
+                indices = [
+                    self.corpus.name2idx[name]
+                    for name in before_premises_list
+                    if name in self.corpus.name2idx
+                ]
+                batch_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+
+            # 3. Get the dynamic context embedding using the GNN.
+            context_emb = self.gnn_model.get_dynamic_context_embedding(
+                initial_context_emb,
+                self.corpus_embeddings, # These are the GNN-refined premise embeddings
+                batch_neighbor_indices,
+            )
+        else:
+            # ORIGINAL STATIC RETRIEVAL (no change here)
+            context_emb = self._encode(batch["context_ids"], batch["context_mask"])
         assert not self.embeddings_staled
         retrieved_premises, scores = self.corpus.get_nearest_premises(
             self.corpus_embeddings,

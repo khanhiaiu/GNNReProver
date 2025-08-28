@@ -113,3 +113,38 @@ class GNNRetriever(pl.LightningModule):
         return get_optimizers(
             self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps
         )
+    
+    @torch.no_grad()
+    def get_dynamic_context_embedding(
+        self,
+        initial_context_embs: torch.FloatTensor,
+        gnn_node_features: torch.FloatTensor,
+        batch_neighbor_indices: List[torch.LongTensor],
+    ) -> torch.FloatTensor:
+        """
+        Computes the final context embedding for a batch by combining initial text-based
+        embeddings with aggregated neighbor embeddings (from before_premises).
+        This method is intended for inference.
+        """
+        self.eval()  # Ensure the model is in evaluation mode
+
+        final_context_embs = []
+        # Loop through each item in the batch
+        for i, indices in enumerate(batch_neighbor_indices):
+            if len(indices) == 0:
+                # If there are no neighbors, the aggregated embedding is a zero vector.
+                aggregated_neighbors_emb = torch.zeros_like(initial_context_embs[i])
+            else:
+                # Ensure indices are on the correct device
+                indices = indices.to(gnn_node_features.device)
+                neighbor_embs = gnn_node_features[indices]
+                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0)
+
+        
+            current_initial_emb = initial_context_embs[i]
+            combined_emb = torch.cat([current_initial_emb, aggregated_neighbors_emb])
+            final_context_emb = self.aggregation_layer(combined_emb)
+            final_context_embs.append(final_context_emb)
+
+        context_emb = torch.stack(final_context_embs)
+        return F.normalize(context_emb, dim=1)
