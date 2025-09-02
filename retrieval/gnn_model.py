@@ -61,8 +61,12 @@ class GNNRetriever(pl.LightningModule):
         neg_premises_indices: List[torch.LongTensor],
         label: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        # Ensure consistent dtype and device from the start
+        target_dtype = self.aggregation_layer.weight.dtype
+        target_device = self.aggregation_layer.weight.device
+        
         # GNN propagation on the whole graph
-        x = node_features
+        x = node_features.to(dtype=target_dtype, device=target_device)
         for i, layer in enumerate(self.layers):
             x = layer(x, edge_index)
             # Apply activation and dropout to all but the last layer
@@ -71,14 +75,18 @@ class GNNRetriever(pl.LightningModule):
                 x = F.dropout(x, p=0.5, training=self.training)
         gnn_node_features = F.normalize(x, p=2, dim=1)
 
+        # Ensure consistent dtype and device for aggregation
+        context_features = context_features.to(dtype=target_dtype, device=target_device)
+        gnn_node_features = gnn_node_features.to(dtype=target_dtype, device=target_device)
+
         # Ghost node aggregation
         final_context_embs = []
         for i, indices in enumerate(neighbor_indices):
             if len(indices) == 0:
-                aggregated_neighbors_emb = torch.zeros_like(context_features[i])
+                aggregated_neighbors_emb = torch.zeros_like(context_features[i], dtype=target_dtype, device=target_device)
             else:
                 neighbor_embs = gnn_node_features[indices]
-                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0)
+                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0).to(dtype=target_dtype, device=target_device)
 
             initial_context_emb = context_features[i]
             combined_emb = torch.cat([initial_context_emb, aggregated_neighbors_emb])
@@ -138,17 +146,24 @@ class GNNRetriever(pl.LightningModule):
         """
         self.eval()  # Ensure the model is in evaluation mode
 
+        # Ensure both tensors have the same dtype and device
+        target_dtype = self.aggregation_layer.weight.dtype
+        target_device = self.aggregation_layer.weight.device
+        
+        initial_context_embs = initial_context_embs.to(dtype=target_dtype, device=target_device)
+        gnn_node_features = gnn_node_features.to(dtype=target_dtype, device=target_device)
+
         final_context_embs = []
         # Loop through each item in the batch
         for i, indices in enumerate(batch_neighbor_indices):
             if len(indices) == 0:
                 # If there are no neighbors, the aggregated embedding is a zero vector.
-                aggregated_neighbors_emb = torch.zeros_like(initial_context_embs[i])
+                aggregated_neighbors_emb = torch.zeros_like(initial_context_embs[i], dtype=target_dtype, device=target_device)
             else:
                 # Ensure indices are on the correct device
                 indices = indices.to(gnn_node_features.device)
                 neighbor_embs = gnn_node_features[indices]
-                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0)
+                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0).to(dtype=target_dtype, device=target_device)
 
         
             current_initial_emb = initial_context_embs[i]
