@@ -1,4 +1,13 @@
 import torch
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
 import pickle
 import argparse
 import torch.nn.functional as F
@@ -50,7 +59,14 @@ def main() -> None:
 
         # GNN forward pass for inference
         with torch.no_grad():
-            x = initial_embeddings
+            # Log dtype information for debugging
+            logger.info(f"Initial embeddings dtype: {initial_embeddings.dtype}")
+            logger.info(f"GNN model parameter dtype: {next(gnn_model.parameters()).dtype}")
+            
+            # Ensure dtype compatibility between initial embeddings and GNN model
+            x = initial_embeddings.to(next(gnn_model.parameters()).dtype)
+            logger.info(f"Converted embeddings dtype: {x.dtype}")
+            
             for i, layer in enumerate(gnn_model.layers):
                 x = layer(x, edge_index)
                 if i < len(gnn_model.layers) - 1:

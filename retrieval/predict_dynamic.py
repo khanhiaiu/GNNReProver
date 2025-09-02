@@ -1,6 +1,17 @@
 # retrieval/predict_dynamic.py
 import os
 import torch
+
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
+
 import pickle
 import argparse
 from loguru import logger
@@ -57,6 +68,7 @@ def main() -> None:
         max_seq_len=2048,
     )
     datamodule.corpus = retriever.corpus
+    datamodule.setup("predict")  # Explicitly setup datasets now that corpus is available
 
     # 5. Run prediction.
     trainer = pl.Trainer(

@@ -3,6 +3,16 @@
 import os
 import json
 import torch
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
+
 import random
 import itertools
 from tqdm import tqdm
@@ -11,7 +21,7 @@ from copy import deepcopy
 from lean_dojo import Pos
 import pytorch_lightning as pl
 from lean_dojo import LeanGitRepo
-from typing import Optional, List
+from typing import Optional, List, Union
 from transformers import AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -200,10 +210,12 @@ class RetrievalDataset(Dataset):
 
 
 class RetrievalDataModule(pl.LightningDataModule):
+    corpus: Optional[Corpus]
+    
     def __init__(
         self,
         data_path: str,
-        corpus_path: str,
+        corpus_path: Optional[str],
         num_negatives: int,
         num_in_file_negatives: int,
         model_name: str,
@@ -223,7 +235,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.corpus = Corpus(corpus_path)
+        self.corpus = Corpus(corpus_path) if corpus_path is not None else None
 
         metadata = json.load(open(os.path.join(data_path, "../metadata.json")))
         repo = LeanGitRepo(**metadata["from_repo"])
@@ -232,6 +244,9 @@ class RetrievalDataModule(pl.LightningDataModule):
         pass
 
     def setup(self, stage: Optional[str] = None) -> None:
+        if self.corpus is None:
+            return  # Skip setup if corpus is not available yet
+            
         self.ds_train = RetrievalDataset(
             [os.path.join(self.data_path, "train.json")],
             self.corpus,

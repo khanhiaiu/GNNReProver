@@ -1,5 +1,15 @@
 import os
 import torch  # <-- Add this import
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
+
 from loguru import logger
 from pytorch_lightning.cli import LightningCLI
 

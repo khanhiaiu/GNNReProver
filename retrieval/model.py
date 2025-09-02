@@ -2,6 +2,16 @@
 
 import os
 import torch
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
+
 import pickle
 import numpy as np
 from tqdm import tqdm
