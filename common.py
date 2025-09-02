@@ -356,7 +356,8 @@ class Corpus:
         k: int,
     ) -> Tuple[List[List[Premise]], List[List[float]]]:
         """Perform a batch of nearest neighbour search."""
-        similarities = batch_context_emb @ premise_embeddings.t()
+        # Ensure both tensors have the same dtype for matrix multiplication
+        similarities = batch_context_emb @ premise_embeddings.to(batch_context_emb.dtype).t()
         idxs_batch = similarities.argsort(dim=1, descending=True).tolist()
         results = [[] for _ in batch_context]
         scores = [[] for _ in batch_context]
