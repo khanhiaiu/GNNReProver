@@ -24,10 +24,10 @@ from retrieval.datamodule import RetrievalDataModule
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Script for dynamic GNN-based retrieval.")
+    parser = argparse.ArgumentParser(description="Script for dynamic GNN-based or static retrieval.")
     parser.add_argument("--retriever_ckpt_path", type=str, required=True, help="Path to the ByT5 retriever checkpoint.")
-    parser.add_argument("--gnn_ckpt_path", type=str, required=True, help="Path to the GNN checkpoint.")
-    parser.add_argument("--indexed_corpus_path", type=str, required=True, help="Path to the GNN-refined indexed corpus.")
+    parser.add_argument("--gnn_ckpt_path", type=str, default=None, help="Optional path to the GNN checkpoint. If not provided, performs static retrieval.")
+    parser.add_argument("--indexed_corpus_path", type=str, required=True, help="Path to the indexed corpus.")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the data (e.g., data/leandojo_benchmark_4/random).")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the prediction pickle file.")
     parser.add_argument("--batch_size", type=int, default=64)
@@ -42,19 +42,20 @@ def main() -> None:
         indexed_corpus = pickle.load(f)
 
     # 2. Load the main PremiseRetriever (the text encoder).
-    # We load it via HF because it's just a frozen encoder for this task.
     retriever = PremiseRetriever.load_hf(args.retriever_ckpt_path, 2048, device)
     retriever.corpus = indexed_corpus.corpus
     retriever.corpus_embeddings = indexed_corpus.embeddings.to(device)
     retriever.embeddings_staled = False
 
-    # 3. Load the GNN model and attach it to the retriever.
-    gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
-    retriever.gnn_model = gnn_model
+    # 3. If a GNN checkpoint is provided, load it for dynamic retrieval.
+    if args.gnn_ckpt_path:
+        logger.info(f"Loading GNN from {args.gnn_ckpt_path} for dynamic retrieval.")
+        gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
+        retriever.gnn_model = gnn_model
+    else:
+        logger.info("No GNN checkpoint provided. Performing static retrieval.")
 
     # 4. Set up the datamodule to feed data to the retriever.
-    # Note: We need a dummy model_name for the datamodule's tokenizer,
-    # but the retriever already has its own correct tokenizer loaded.
     datamodule = RetrievalDataModule(
         data_path=args.data_path,
         corpus_path=None, # Not needed, corpus is in retriever
@@ -76,11 +77,17 @@ def main() -> None:
         devices=1,
         logger=False,
     )
-    predictions = trainer.predict(retriever, datamodule=datamodule)
+    list_of_batch_results = trainer.predict(retriever, datamodule=datamodule)
 
-    # The predictions are stored in retriever.predict_step_outputs
+    final_count = len(retriever.predict_step_outputs)
+    logger.info("--- FINAL CHECK IN MAIN PROCESS ---")
+    logger.info(f"The number of predictions available in the main process is: {final_count}")
+
+    # We need to flatten this list of lists into a single list of predictions
+    all_predictions = [item for batch in list_of_batch_results for item in batch]
+
     with open(args.output_path, "wb") as f:
-        pickle.dump(retriever.predict_step_outputs, f)
+        pickle.dump(all_predictions, f)
     logger.info(f"Dynamic retrieval predictions saved to {args.output_path}")
 
 

@@ -327,6 +327,9 @@ class PremiseRetriever(pl.LightningModule):
             self.num_retrieved,
         )
 
+        batch_outputs = []
+        
+        items_in_batch = 0
         for (
             url,
             commit,
@@ -336,6 +339,7 @@ class PremiseRetriever(pl.LightningModule):
             tactic_idx,
             ctx,
             pos_premises,
+            before_premises_list,
             premises,
             s,
         ) in zip_strict(
@@ -347,23 +351,33 @@ class PremiseRetriever(pl.LightningModule):
             batch["tactic_idx"],
             batch["context"],
             batch["all_pos_premises"],
+            batch["before_premises"],
             retrieved_premises,
             scores,
         ):
-            self.predict_step_outputs.append(
-                {
-                    "url": url,
-                    "commit": commit,
-                    "file_path": file_path,
-                    "full_name": full_name,
-                    "start": start,
-                    "tactic_idx": tactic_idx,
-                    "context": ctx,
-                    "all_pos_premises": pos_premises,
-                    "retrieved_premises": premises,
-                    "scores": s,
-                }
-            )
+            prediction_item ={
+                "url": url,
+                "commit": commit,
+                "file_path": file_path,
+                "full_name": full_name,
+                "start": start,
+                "tactic_idx": tactic_idx,
+                "context": ctx,
+                "all_pos_premises": pos_premises,
+                "before_premises": before_premises_list,
+                "retrieved_premises": premises,
+                "scores": s,
+            }
+            items_in_batch += 1 # 
+            self.predict_step_outputs.append(prediction_item) # Keep this for backward compatibility
+            batch_outputs.append(prediction_item)  
+
+
+        logger.info(
+            f"Worker PID: {os.getpid()} "
+            f"Worker's local list size: {len(self.predict_step_outputs)} {len(batch_outputs)}"
+        )
+        return batch_outputs
 
     def on_predict_epoch_end(self) -> None:
         if self.trainer.log_dir is not None:
@@ -372,7 +386,7 @@ class PremiseRetriever(pl.LightningModule):
                 pickle.dump(self.predict_step_outputs, oup)
             logger.info(f"Retrieval predictions saved to {path}")
 
-        self.predict_step_outputs.clear()
+            self.predict_step_outputs.clear()
 
     @torch.no_grad()
     def retrieve(
