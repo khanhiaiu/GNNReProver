@@ -132,3 +132,6 @@ dmypy.json
 .pyre/
 logs/
 wandb/
+scripts/run_baseline_retrieval.sh
+scripts/run_random_baseline.sh
+gnn_training_command.txt
