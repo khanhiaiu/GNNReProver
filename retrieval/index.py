@@ -71,6 +71,8 @@ def main() -> None:
                 x = layer(x, edge_index)
                 if i < len(gnn_model.layers) - 1:
                     x = F.relu(x)
+                    x = F.dropout(x, p=gnn_model.dropout_p, training=False)
+
             final_embeddings = x
     else:
         print("NO GNN provided, using initial embeddings.")

@@ -47,6 +47,8 @@ class GNNRetriever(pl.LightningModule):
         # For aggregating ghost node neighbors and combining with its own embedding
         self.aggregation_layer = nn.Linear(feature_size * 2, feature_size)
 
+        self.dropout_p = 0.5
+
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "GNNRetriever":
         return load_checkpoint(cls, ckpt_path, device, freeze)
@@ -72,7 +74,7 @@ class GNNRetriever(pl.LightningModule):
             # Apply activation and dropout to all but the last layer
             if i < len(self.layers) - 1:
                 x = F.relu(x)
-                x = F.dropout(x, p=0.5, training=self.training)
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
         gnn_node_features = F.normalize(x, p=2, dim=1)
 
         # Ensure consistent dtype and device for aggregation
