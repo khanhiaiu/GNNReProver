@@ -64,16 +64,25 @@ def gnn_collate_fn(
     # THE FIX: Move the GPU-generated tensor back to the CPU before returning.
     batch["context_features"] = _WORKER_RETRIEVER._encode(input_ids, attention_mask).cpu()
 
-    # ... (The rest of the function remains exactly the same) ...
-    neighbor_indices = []
+    lctx_neighbor_indices = []
     for ex in examples:
         indices = [
             corpus.name2idx[name]
-            for name in ex["before_premises"]
+            for name in ex["lctx_premises"]
             if name in corpus.name2idx
         ]
-        neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
-    batch["neighbor_indices"] = neighbor_indices
+        lctx_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+    batch["lctx_neighbor_indices"] = lctx_neighbor_indices
+
+    goal_neighbor_indices = []
+    for ex in examples:
+        indices = [
+            corpus.name2idx[name]
+            for name in ex["goal_premises"]
+            if name in corpus.name2idx
+        ]
+        goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+    batch["goal_neighbor_indices"] = goal_neighbor_indices
 
     pos_premise_indices = [
         corpus.name2idx[ex["pos_premise"].full_name] for ex in examples

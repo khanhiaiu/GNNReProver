@@ -28,6 +28,11 @@ Batch = Dict[str, Any]
 MARK_START_SYMBOL = "<a>"
 MARK_END_SYMBOL = "</a>"
 
+EDGE_TYPES = {
+    "signature_lctx": 0,
+    "signature_goal": 1,
+    "proof": 2,
+}
 
 def remove_marks(s: str) -> str:
     """Remove all :code:`<a>` and :code:`</a>` from ``s``."""
@@ -281,12 +286,6 @@ class Corpus:
         edges = []
         edges_dojo = []
         
-        # Define edge types
-        EDGE_TYPES = {
-            "signature_lctx": 0,
-            "signature_goal": 1,
-            "proof": 2,
-        }
 
         for p1 in self.all_premises:
             if p1.full_name not in self.name2idx:

@@ -306,15 +306,24 @@ class PremiseRetriever(pl.LightningModule):
             # 1. Get initial context embedding from the text encoder.
             initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
 
-            # 2. Prepare neighbor indices from `before_premises`.
-            batch_neighbor_indices = []
-            for before_premises_list in batch["before_premises"]:
+            # 2. Prepare neighbor indices from `lctx_premises` and `goal_premises`.
+            batch_lctx_neighbor_indices = []
+            for lctx_premises_list in batch["lctx_premises"]:
                 indices = [
                     self.corpus.name2idx[name]
-                    for name in before_premises_list
+                    for name in lctx_premises_list
                     if name in self.corpus.name2idx
                 ]
-                batch_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+                batch_lctx_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+            
+            batch_goal_neighbor_indices = []
+            for goal_premises_list in batch["goal_premises"]:
+                indices = [
+                    self.corpus.name2idx[name]
+                    for name in goal_premises_list
+                    if name in self.corpus.name2idx
+                ]
+                batch_goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
 
             # 3. Get the initial (layer 0) premise embeddings from the indexed corpus.
             #    NOTE: For this to work, the indexed_corpus must store initial embeddings.
@@ -325,7 +334,8 @@ class PremiseRetriever(pl.LightningModule):
             # 4. Get the dynamic context embedding using the GNN's symmetric pass.
             context_emb, final_premise_embs = self.gnn_model.get_dynamic_context_embedding(
                 initial_context_embs=initial_context_emb,
-                batch_neighbor_indices=batch_neighbor_indices,
+                batch_lctx_neighbor_indices=batch_lctx_neighbor_indices,
+                batch_goal_neighbor_indices=batch_goal_neighbor_indices,
                 initial_node_features=initial_node_features,
                 edge_index=edge_index,
                 edge_attr=edge_attr,
@@ -368,7 +378,8 @@ class PremiseRetriever(pl.LightningModule):
             tactic_idx,
             ctx,
             pos_premises,
-            before_premises_list,
+            lctx_premises,
+            goal_premises,
             premises,
             s,
         ) in zip_strict(
@@ -380,7 +391,8 @@ class PremiseRetriever(pl.LightningModule):
             batch["tactic_idx"],
             batch["context"],
             batch["all_pos_premises"],
-            batch["before_premises"],
+            batch["lctx_premises"],
+            batch["goal_premises"],
             retrieved_premises,
             scores,
         ):
@@ -393,7 +405,8 @@ class PremiseRetriever(pl.LightningModule):
                 "tactic_idx": tactic_idx,
                 "context": ctx,
                 "all_pos_premises": pos_premises,
-                "before_premises": before_premises_list,
+                "lctx_premises": lctx_premises,
+                "goal_premises": goal_premises,
                 "retrieved_premises": premises,
                 "scores": s,
             }

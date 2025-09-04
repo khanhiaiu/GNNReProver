@@ -67,8 +67,9 @@ class RetrievalDataset(Dataset):
                 all_pos_premises = get_all_pos_premises(
                     tac["annotated_tactic"], self.corpus
                 )
-                # BIG TODO: try all, the graph of signatures' premises and proofs' premises and both?
-                before_premises_names = set()
+                
+                lctx_premises_names = set()
+                goal_premises_names = set()
                 if "before_premises" in tac and tac["before_premises"]:
                     for goal_data in tac["before_premises"]:
                         # Use the new parameter to select the verbosity level.
@@ -76,10 +77,10 @@ class RetrievalDataset(Dataset):
                         
                         for p in premises_at_level.get("lctxPremises", []):
                             if p and p.get("fullName"):
-                                before_premises_names.add(p["fullName"])
+                                lctx_premises_names.add(p["fullName"])
                         for p in premises_at_level.get("goalPremises", []):
                             if p and p.get("fullName"):
-                                before_premises_names.add(p["fullName"])
+                                goal_premises_names.add(p["fullName"])
 
                 base_example = {
                     "url": thm["url"],
@@ -90,7 +91,8 @@ class RetrievalDataset(Dataset):
                     "tactic_idx": i,
                     "context": context,
                     "all_pos_premises": all_pos_premises,
-                    "before_premises": list(before_premises_names),
+                    "lctx_premises": list(lctx_premises_names),
+                    "goal_premises": list(goal_premises_names),
                 }
 
                 if self.is_train:

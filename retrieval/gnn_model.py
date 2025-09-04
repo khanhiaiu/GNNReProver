@@ -15,7 +15,7 @@ import pytorch_lightning as pl
 from typing import Dict, Any, List, Tuple, Optional
 from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv
 
-from common import get_optimizers, load_checkpoint
+from common import EDGE_TYPES, get_optimizers, load_checkpoint
 
 class GNNRetriever(pl.LightningModule):
     def __init__(
@@ -114,7 +114,8 @@ class GNNRetriever(pl.LightningModule):
         context_features: torch.FloatTensor, 
         edge_index: torch.LongTensor,
         edge_attr: Optional[torch.LongTensor],
-        neighbor_indices: List[torch.LongTensor]
+        lctx_neighbor_indices: List[torch.LongTensor],
+        goal_neighbor_indices: List[torch.LongTensor],
     ) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor]]:
         """
         Create augmented graph by adding ghost nodes and their connections.
@@ -143,15 +144,19 @@ class GNNRetriever(pl.LightningModule):
         new_edges_dst = []
         new_edge_attrs = []
         
-        for i, indices in enumerate(neighbor_indices):
+        for i, indices in enumerate(lctx_neighbor_indices):
             ghost_node_idx = num_premises + i
-            # Create DIRECTED edges from neighbors to their corresponding ghost nodes.
             for neighbor_idx in indices:
                 new_edges_src.append(neighbor_idx.item())
                 new_edges_dst.append(ghost_node_idx)
-                # For new edges to ghost nodes, we can use a special edge type (e.g., type 0)
-                # or we could add a new edge type specifically for context connections
-                new_edge_attrs.append(TODO we have to pass stuff for this to this function)
+                new_edge_attrs.append(EDGE_TYPES["signature_lctx"])
+
+        for i, indices in enumerate(goal_neighbor_indices):
+            ghost_node_idx = num_premises + i
+            for neighbor_idx in indices:
+                new_edges_src.append(neighbor_idx.item())
+                new_edges_dst.append(ghost_node_idx)
+                new_edge_attrs.append(EDGE_TYPES["signature_goal"])
         
         if new_edges_src:
             new_edges = torch.tensor([new_edges_src, new_edges_dst], dtype=torch.long, device=target_device)
@@ -217,7 +222,8 @@ class GNNRetriever(pl.LightningModule):
         node_features: torch.FloatTensor,
         edge_index: torch.LongTensor,
         context_features: torch.FloatTensor,
-        neighbor_indices: List[torch.LongTensor],
+        lctx_neighbor_indices: List[torch.LongTensor],
+        goal_neighbor_indices: List[torch.LongTensor],
         pos_premise_indices: torch.LongTensor,
         neg_premises_indices: List[torch.LongTensor],
         label: torch.FloatTensor,
@@ -227,7 +233,7 @@ class GNNRetriever(pl.LightningModule):
 
         # --- 1. Create Augmented Graph ---
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph(
-            node_features, context_features, edge_index, edge_attr, neighbor_indices
+            node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
             
         # --- 2. Single GNN Pass on Augmented Graph ---
@@ -252,7 +258,8 @@ class GNNRetriever(pl.LightningModule):
             batch["node_features"],
             batch["edge_index"],
             batch["context_features"],
-            batch["neighbor_indices"],
+            batch["lctx_neighbor_indices"],
+            batch["goal_neighbor_indices"],
             batch["pos_premise_indices"],
             batch["neg_premises_indices"],
             batch["label"],
@@ -276,8 +283,8 @@ class GNNRetriever(pl.LightningModule):
     def get_dynamic_context_embedding(
         self,
         initial_context_embs: torch.FloatTensor,
-        batch_neighbor_indices: List[torch.LongTensor],
-        # We need the initial premise embeddings and edge index for the combined pass
+        batch_lctx_neighbor_indices: List[torch.LongTensor],
+        batch_goal_neighbor_indices: List[torch.LongTensor],
         initial_node_features: torch.FloatTensor,
         edge_index: torch.LongTensor,
         edge_attr: Optional[torch.LongTensor] = None,
@@ -291,7 +298,7 @@ class GNNRetriever(pl.LightningModule):
 
         # Create augmented graph with ghost nodes
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph(
-            initial_node_features, initial_context_embs, edge_index, edge_attr, batch_neighbor_indices
+            initial_node_features, initial_context_embs, edge_index, edge_attr, batch_lctx_neighbor_indices, batch_goal_neighbor_indices
         )
 
         # Single GNN pass
