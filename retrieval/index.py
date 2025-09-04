@@ -88,12 +88,7 @@ def main() -> None:
                 x = initial_embeddings.to(next(gnn_model.parameters()).dtype)
                 logger.info(f"Converted embeddings dtype: {x.dtype}")
                 
-                for i, layer in enumerate(gnn_model.layers):
-                    x = layer(x, edge_index)
-                    if i < len(gnn_model.layers) - 1:
-                        x = F.relu(x)
-                        x = F.dropout(x, p=gnn_model.dropout_p, training=False)
-                final_embeddings = x
+                final_embeddings = gnn_model.forward_embeddings(x, edge_index)
         else:
             logger.info("NO GNN provided, using initial text-encoder embeddings.")
             final_embeddings = initial_embeddings

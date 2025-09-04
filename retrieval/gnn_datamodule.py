@@ -46,6 +46,7 @@ def gnn_collate_fn(
     batch = {}
     batch["node_features"] = node_features
     batch["edge_index"] = corpus.premise_dep_graph.edge_index
+    batch["edge_attr"] = corpus.premise_dep_graph.edge_attr 
 
     # Get context embeddings using the worker-local retriever
     contexts = [ex["context"] for ex in examples]

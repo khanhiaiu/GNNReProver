@@ -316,16 +316,39 @@ class PremiseRetriever(pl.LightningModule):
                 ]
                 batch_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
 
-            # 3. Get the dynamic context embedding using the GNN.
+            # 3. Get the initial (layer 0) premise embeddings from the indexed corpus.
+            #    NOTE: For this to work, the indexed_corpus must store initial embeddings.
+            initial_node_features = self.corpus_embeddings 
+            edge_index = self.corpus.premise_dep_graph.edge_index
+
+            # 4. Get the dynamic context embedding using the GNN's symmetric pass.
             context_emb = self.gnn_model.get_dynamic_context_embedding(
-                initial_context_emb,
-                self.corpus_embeddings, # These are the GNN-refined premise embeddings
-                batch_neighbor_indices,
+                initial_context_embs=initial_context_emb,
+                batch_neighbor_indices=batch_neighbor_indices,
+                initial_node_features=initial_node_features,
+                edge_index=edge_index,
             )
+            
+            with torch.no_grad():
+                final_premise_embs, _ = self.gnn_model(initial_node_features, edge_index)
+            
+            retrieved_premises, scores = self.corpus.get_nearest_premises(
+                final_premise_embs,
+                batch["context"],
+                context_emb,
+                self.num_retrieved,
+            )
+
         else:
-            #raise RuntimeError("Should not reach here without gnn (this is a debug error to prevent static retrieval)")
-            # ORIGINAL STATIC RETRIEVAL (no change here)
+            # ORIGINAL STATIC RETRIEVAL
             context_emb = self._encode(batch["context_ids"], batch["context_mask"])
+            assert not self.embeddings_staled
+            retrieved_premises, scores = self.corpus.get_nearest_premises(
+                self.corpus_embeddings,
+                batch["context"],
+                context_emb,
+                self.num_retrieved,
+            )
         assert not self.embeddings_staled
         retrieved_premises, scores = self.corpus.get_nearest_premises(
             self.corpus_embeddings,

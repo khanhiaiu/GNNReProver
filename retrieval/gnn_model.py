@@ -12,7 +12,7 @@ torch.load = patched_load
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from torch_geometric.nn import GCNConv
 
 from common import get_optimizers, load_checkpoint
@@ -23,7 +23,6 @@ class GNNRetriever(pl.LightningModule):
     def __init__(
         self,
         feature_size: int,
-        gnn_hidden_size: int,
         num_layers: int,
         lr: float,
         warmup_steps: int,
@@ -32,22 +31,119 @@ class GNNRetriever(pl.LightningModule):
         self.save_hyperparameters()
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
 
+        # Simplified GNN layers: all operate with the same feature_size.
         self.layers = nn.ModuleList()
-        if num_layers == 1:
+        for _ in range(num_layers):
             self.layers.append(GCNConv(feature_size, feature_size))
-        else:
-            # Input layer
-            self.layers.append(GCNConv(feature_size, gnn_hidden_size))
-            # Hidden layers
-            for _ in range(num_layers - 2):
-                self.layers.append(GCNConv(gnn_hidden_size, gnn_hidden_size))
-            # Output layer
-            self.layers.append(GCNConv(gnn_hidden_size, feature_size))
-
-        # For aggregating ghost node neighbors and combining with its own embedding
-        self.aggregation_layer = nn.Linear(feature_size * 2, feature_size)
 
         self.dropout_p = 0.5
+
+    def _gnn_forward_pass(self, x: torch.FloatTensor, edge_index: torch.LongTensor) -> torch.FloatTensor:
+        """
+        Apply GNN layers with ReLU activation and dropout between layers.
+        
+        Args:
+            x: Input node features
+            edge_index: Edge connectivity information
+            
+        Returns:
+            Output node features after passing through all GNN layers
+        """
+        for i, layer in enumerate(self.layers):
+            x = layer(x, edge_index)
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
+        return x
+
+    def _get_target_device_and_dtype(self) -> Tuple[torch.device, torch.dtype]:
+        """Get target device and dtype from the aggregation layer."""
+        return self.layers[0].weight.device, self.layers[0].weight.dtype
+
+    def _create_augmented_graph(
+        self, 
+        node_features: torch.FloatTensor, 
+        context_features: torch.FloatTensor, 
+        edge_index: torch.LongTensor, 
+        neighbor_indices: List[torch.LongTensor]
+    ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
+        """
+        Create augmented graph by adding ghost nodes and their connections.
+        
+        Args:
+            node_features: Original node features
+            context_features: Context features (will become ghost nodes)
+            edge_index: Original edge connectivity
+            neighbor_indices: Lists of neighbor indices for each context
+            
+        Returns:
+            Tuple of (augmented_features, augmented_edge_index)
+        """
+        target_device, target_dtype = self._get_target_device_and_dtype()
+        num_premises = node_features.shape[0]
+        
+        # --- 1. Augment Node Features ---
+        augmented_features = torch.cat(
+            [node_features.to(target_device, target_dtype), context_features.to(target_device, target_dtype)], 
+            dim=0
+        )
+
+        # --- 2. Augment Edges ---
+        new_edges_src = []
+        new_edges_dst = []
+        for i, indices in enumerate(neighbor_indices):
+            ghost_node_idx = num_premises + i
+            # Create DIRECTED edges from neighbors to their corresponding ghost nodes.
+            for neighbor_idx in indices:
+                new_edges_src.append(neighbor_idx.item())
+                new_edges_dst.append(ghost_node_idx)
+        
+        if new_edges_src:
+            new_edges = torch.tensor([new_edges_src, new_edges_dst], dtype=torch.long, device=target_device)
+            augmented_edge_index = torch.cat([edge_index.to(target_device), new_edges], dim=1)
+        else:
+            augmented_edge_index = edge_index.to(target_device)
+            
+        return augmented_features, augmented_edge_index
+
+    def _extract_and_normalize_embeddings(
+        self, 
+        x: torch.FloatTensor, 
+        num_premises: int
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """
+        Extract premise and context embeddings from combined tensor and normalize them.
+        
+        Args:
+            x: Combined tensor containing both premise and context embeddings
+            num_premises: Number of premise nodes (used to split the tensor)
+            
+        Returns:
+            Tuple of (normalized_premise_embeddings, normalized_context_embeddings)
+        """
+        final_premise_embs = F.normalize(x[:num_premises], p=2, dim=1)
+        final_context_embs = F.normalize(x[num_premises:], p=2, dim=1)
+        return final_premise_embs, final_context_embs
+
+    @torch.no_grad()
+    def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor) -> torch.FloatTensor:
+        """
+        Public method to apply GNN layers to embeddings. Used for external inference.
+        This method disables training mode for consistent inference behavior.
+        
+        Args:
+            x: Input node features
+            edge_index: Edge connectivity information
+            
+        Returns:
+            Output node features after passing through all GNN layers
+        """
+        was_training = self.training
+        self.eval()  # Ensure we're in eval mode
+        try:
+            return self._gnn_forward_pass(x, edge_index)
+        finally:
+            self.train(was_training)  # Restore original training mode
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "GNNRetriever":
@@ -63,49 +159,26 @@ class GNNRetriever(pl.LightningModule):
         neg_premises_indices: List[torch.LongTensor],
         label: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        # Ensure consistent dtype and device from the start
-        target_dtype = self.aggregation_layer.weight.dtype
-        target_device = self.aggregation_layer.weight.device
+        num_premises = node_features.shape[0]
+
+        # --- 1. Create Augmented Graph ---
+        augmented_features, augmented_edge_index = self._create_augmented_graph(
+            node_features, context_features, edge_index, neighbor_indices
+        )
+            
+        # --- 2. Single GNN Pass on Augmented Graph ---
+        x = self._gnn_forward_pass(augmented_features, augmented_edge_index)
         
-        # GNN propagation on the whole graph
-        x = node_features.to(dtype=target_dtype, device=target_device)
-        for i, layer in enumerate(self.layers):
-            x = layer(x, edge_index)
-            # Apply activation and dropout to all but the last layer
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout_p, training=self.training)
-        gnn_node_features = F.normalize(x, p=2, dim=1)
+        # --- 3. Extract and Normalize Final Embeddings ---
+        final_premise_embs, final_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
-        # Ensure consistent dtype and device for aggregation
-        context_features = context_features.to(dtype=target_dtype, device=target_device)
-        gnn_node_features = gnn_node_features.to(dtype=target_dtype, device=target_device)
-
-        # Ghost node aggregation
-        final_context_embs = []
-        for i, indices in enumerate(neighbor_indices):
-            if len(indices) == 0:
-                aggregated_neighbors_emb = torch.zeros_like(context_features[i], dtype=target_dtype, device=target_device)
-            else:
-                neighbor_embs = gnn_node_features[indices]
-                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0).to(dtype=target_dtype, device=target_device)
-
-            initial_context_emb = context_features[i]
-            combined_emb = torch.cat([initial_context_emb, aggregated_neighbors_emb])
-            final_context_emb = self.aggregation_layer(combined_emb)
-            final_context_embs.append(final_context_emb)
-
-        context_emb = torch.stack(final_context_embs)
-        context_emb = F.normalize(context_emb, dim=1)
-
-        # In-batch contrastive loss using GNN-enhanced premise embeddings
-        batch_size = context_emb.shape[0]
-        pos_premise_emb = gnn_node_features[pos_premise_indices]
-        neg_premise_embs_flat = [gnn_node_features[neg_idxs] for neg_idxs in neg_premises_indices]
+        # --- 4. Contrastive Loss Calculation ---
+        pos_premise_emb = final_premise_embs[pos_premise_indices]
+        neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
         
         all_premise_embs = torch.cat([pos_premise_emb] + neg_premise_embs_flat, dim=0)
 
-        similarity = torch.mm(context_emb, all_premise_embs.t())
+        similarity = torch.mm(final_context_embs, all_premise_embs.t())
         assert -1.001 <= similarity.min() <= similarity.max() <= 1.001, f"Got {similarity.min()} and {similarity.max()}"
         loss = F.mse_loss(similarity, label)
         return loss
@@ -138,40 +211,27 @@ class GNNRetriever(pl.LightningModule):
     def get_dynamic_context_embedding(
         self,
         initial_context_embs: torch.FloatTensor,
-        gnn_node_features: torch.FloatTensor,
         batch_neighbor_indices: List[torch.LongTensor],
-    ) -> torch.FloatTensor:
+        # We need the initial premise embeddings and edge index for the combined pass
+        initial_node_features: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
-        Computes the final context embedding for a batch by combining initial text-based
-        embeddings with aggregated neighbor embeddings (from before_premises).
+        Computes final context and premise embeddings by adding ghost nodes to the graph.
         This method is intended for inference.
         """
-        self.eval()  # Ensure the model is in evaluation mode
+        self.eval()
+        num_premises = initial_node_features.shape[0]
 
-        # Ensure both tensors have the same dtype and device
-        target_dtype = self.aggregation_layer.weight.dtype
-        target_device = self.aggregation_layer.weight.device
+        # Create augmented graph with ghost nodes
+        augmented_features, augmented_edge_index = self._create_augmented_graph(
+            initial_node_features, initial_context_embs, edge_index, batch_neighbor_indices
+        )
+
+        # Single GNN pass
+        x = self._gnn_forward_pass(augmented_features, augmented_edge_index)
+
+        # Extract and normalize final embeddings
+        final_premise_embs, final_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
         
-        initial_context_embs = initial_context_embs.to(dtype=target_dtype, device=target_device)
-        gnn_node_features = gnn_node_features.to(dtype=target_dtype, device=target_device)
-
-        final_context_embs = []
-        # Loop through each item in the batch
-        for i, indices in enumerate(batch_neighbor_indices):
-            if len(indices) == 0:
-                # If there are no neighbors, the aggregated embedding is a zero vector.
-                aggregated_neighbors_emb = torch.zeros_like(initial_context_embs[i], dtype=target_dtype, device=target_device)
-            else:
-                # Ensure indices are on the correct device
-                indices = indices.to(gnn_node_features.device)
-                neighbor_embs = gnn_node_features[indices]
-                aggregated_neighbors_emb = torch.mean(neighbor_embs, dim=0).to(dtype=target_dtype, device=target_device)
-
-        
-            current_initial_emb = initial_context_embs[i]
-            combined_emb = torch.cat([current_initial_emb, aggregated_neighbors_emb])
-            final_context_emb = self.aggregation_layer(combined_emb)
-            final_context_embs.append(final_context_emb)
-
-        context_emb = torch.stack(final_context_embs)
-        return F.normalize(context_emb, dim=1)
+        return final_context_embs, final_premise_embs

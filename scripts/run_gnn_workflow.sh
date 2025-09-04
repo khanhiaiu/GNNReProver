@@ -80,12 +80,12 @@ echo "W&B Run Name will be: $EXP_NAME"
 echo "Overriding GNN layers to: $NUM_LAYERS"
 echo "------------------------------------------------"
 
-python retrieval/train_gnn.py fit \
-    --config $GNN_CONFIG \
-    --model.num_layers $NUM_LAYERS \
-    --data.data_path "$DATA_PATH/" \
-    --trainer.logger.name "$EXP_NAME" \
-    --trainer.logger.save_dir "$LOG_DIR"
+#python retrieval/train_gnn.py fit \
+#    --config $GNN_CONFIG \
+#    --model.num_layers $NUM_LAYERS \
+#    --data.data_path "$DATA_PATH/" \
+#    --trainer.logger.name "$EXP_NAME" \
+#    --trainer.logger.save_dir "$LOG_DIR"
 
 # --- DEBUGGING AND DYNAMICALLY FINDING THE CHECKPOINT PATH ---
 echo "Training complete. Displaying directory structure for debugging:"
@@ -113,11 +113,11 @@ echo "Using GNN checkpoint: $GNN_CHECKPOINT_PATH"
 echo "Output will be saved to: $GNN_INDEX_PATH"
 echo "--------------------------------------------------------"
 
-python retrieval/index.py \
-    --ckpt_path $BASE_RETRIEVER \
-    --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
-    --corpus-path "$CORPUS_PATH" \
-    --output-path "$GNN_INDEX_PATH"
+#python retrieval/index.py \
+#    --ckpt_path $BASE_RETRIEVER \
+#    --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
+#    --corpus-path "$CORPUS_PATH" \
+#    --output-path "$GNN_INDEX_PATH"
 
 echo "Indexing complete."
 
@@ -154,5 +154,4 @@ echo
 echo "================================================================="
 echo "Workflow Finished Successfully!"
 echo "Final results are printed above."
-echo "All artifacts for this run are in: $LOG_DIR"
 echo "================================================================="
