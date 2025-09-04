@@ -320,17 +320,16 @@ class PremiseRetriever(pl.LightningModule):
             #    NOTE: For this to work, the indexed_corpus must store initial embeddings.
             initial_node_features = self.corpus_embeddings 
             edge_index = self.corpus.premise_dep_graph.edge_index
+            edge_attr = getattr(self.corpus.premise_dep_graph, 'edge_attr', None)
 
             # 4. Get the dynamic context embedding using the GNN's symmetric pass.
-            context_emb = self.gnn_model.get_dynamic_context_embedding(
+            context_emb, final_premise_embs = self.gnn_model.get_dynamic_context_embedding(
                 initial_context_embs=initial_context_emb,
                 batch_neighbor_indices=batch_neighbor_indices,
                 initial_node_features=initial_node_features,
                 edge_index=edge_index,
+                edge_attr=edge_attr,
             )
-            
-            with torch.no_grad():
-                final_premise_embs, _ = self.gnn_model(initial_node_features, edge_index)
             
             retrieved_premises, scores = self.corpus.get_nearest_premises(
                 final_premise_embs,
