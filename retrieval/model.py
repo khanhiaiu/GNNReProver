@@ -202,6 +202,7 @@ class PremiseRetriever(pl.LightningModule):
         if not self.embeddings_staled:
             return
         logger.info("Re-indexing the retrieval corpus")
+        raise RuntimeError("Should not reindex when using gnn (this is a debug error to prevent reindexing)")
 
         self.corpus_embeddings = torch.zeros(
             len(self.corpus.all_premises),
@@ -288,10 +289,15 @@ class PremiseRetriever(pl.LightningModule):
     ##############
 
     def on_predict_start(self) -> None:
-        self.corpus = self.trainer.datamodule.corpus
-        self.corpus_embeddings = None
-        self.embeddings_staled = True
-        self.reindex_corpus(self.trainer.datamodule.eval_batch_size)
+        if self.corpus_embeddings is not None:
+            logger.info("Corpus embeddings are already loaded. Skipping re-indexing.")
+            self.embeddings_staled = False
+        else:
+            self.corpus = self.trainer.datamodule.corpus
+            self.corpus_embeddings = None
+            self.embeddings_staled = True
+            self.reindex_corpus(self.trainer.datamodule.eval_batch_size)
+
         self.predict_step_outputs = []
 
     def predict_step(self, batch: Dict[str, Any], _):
@@ -317,6 +323,7 @@ class PremiseRetriever(pl.LightningModule):
                 batch_neighbor_indices,
             )
         else:
+            #raise RuntimeError("Should not reach here without gnn (this is a debug error to prevent static retrieval)")
             # ORIGINAL STATIC RETRIEVAL (no change here)
             context_emb = self._encode(batch["context_ids"], batch["context_mask"])
         assert not self.embeddings_staled

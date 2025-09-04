@@ -12,18 +12,19 @@ import pickle
 import argparse
 import torch.nn.functional as F
 from loguru import logger
+from transformers import AutoConfig
 
-from common import IndexedCorpus
+from common import Corpus, IndexedCorpus
 from retrieval.model import PremiseRetriever
 from retrieval.gnn_model import GNNRetriever
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Script for training the BM25 premise retriever."
+        description="Script for creating an indexed corpus for retrieval."
     )
     parser.add_argument(
-        "--ckpt_path", type=str, required=True, help="Path to the ByT5 retriever checkpoint."
+        "--ckpt_path", type=str, required=True, help="Path to the ByT5 retriever checkpoint. Used for config even in random mode."
     )
     parser.add_argument(
         "--gnn_ckpt_path", type=str, help="Optional path to the GNN checkpoint."
@@ -34,53 +35,72 @@ def main() -> None:
         type=str,
         required=True,
     )
+    parser.add_argument(
+        "--random-embeddings",
+        action="store_true",
+        help="If set, creates an index with random embeddings instead of using a model.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     args = parser.parse_args()
     logger.info(args)
 
     if not torch.cuda.is_available():
-        logger.warning("Indexing the corpus using CPU can be very slow.")
+        logger.warning("Using CPU can be very slow for non-random indexing.")
         device = torch.device("cpu")
     else:
         device = torch.device("cuda")
 
-    # 1. Get initial embeddings with the frozen text encoder.
-    retriever = PremiseRetriever.load_hf(args.ckpt_path, 2048, device)
-    retriever.load_corpus(args.corpus_path)
-    retriever.reindex_corpus(batch_size=args.batch_size)
-    initial_embeddings = retriever.corpus_embeddings.to(device)
-    corpus = retriever.corpus
+    corpus = Corpus(args.corpus_path)
+    final_embeddings = None
 
-    # 2. Refine embeddings with the GNN if provided.
-    if args.gnn_ckpt_path:
-        logger.info(f"Loading GNN from {args.gnn_ckpt_path}")
-        gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
-        edge_index = corpus.premise_dep_graph.edge_index.to(device)
+    if args.random_embeddings:
+        logger.info("Generating RANDOM embeddings for the corpus.")
+        
+        # We still need ckpt_path to know the correct embedding dimension.
+        config = AutoConfig.from_pretrained(args.ckpt_path)
+        embedding_dim = config.hidden_size
+        num_premises = len(corpus)
+        
+        logger.info(f"Corpus size: {num_premises}, Embedding dim: {embedding_dim}")
 
-        # GNN forward pass for inference
-        with torch.no_grad():
-            # Log dtype information for debugging
-            logger.info(f"Initial embeddings dtype: {initial_embeddings.dtype}")
-            logger.info(f"GNN model parameter dtype: {next(gnn_model.parameters()).dtype}")
-            
-            # Ensure dtype compatibility between initial embeddings and GNN model
-            x = initial_embeddings.to(next(gnn_model.parameters()).dtype)
-            logger.info(f"Converted embeddings dtype: {x.dtype}")
-            
-            for i, layer in enumerate(gnn_model.layers):
-                x = layer(x, edge_index)
-                if i < len(gnn_model.layers) - 1:
-                    x = F.relu(x)
-                    x = F.dropout(x, p=gnn_model.dropout_p, training=False)
+        # Generate and normalize random embeddings. Normalization is crucial
+        # so that dot product is equivalent to cosine similarity.
+        random_embeds = torch.randn(num_premises, embedding_dim)
+        final_embeddings = F.normalize(random_embeds, p=2, dim=1)
 
-            final_embeddings = x
     else:
-        print("NO GNN provided, using initial embeddings.")
-        final_embeddings = initial_embeddings
+        # 1. Get initial embeddings with the frozen text encoder.
+        retriever = PremiseRetriever.load_hf(args.ckpt_path, 2048, device)
+        retriever.load_corpus(corpus) # Pass the already loaded corpus object
+        retriever.reindex_corpus(batch_size=args.batch_size)
+        initial_embeddings = retriever.corpus_embeddings.to(device)
+
+        # 2. Refine embeddings with the GNN if provided.
+        if args.gnn_ckpt_path:
+            logger.info(f"Loading GNN from {args.gnn_ckpt_path}")
+            gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
+            edge_index = corpus.premise_dep_graph.edge_index.to(device)
+
+            with torch.no_grad():
+                logger.info(f"Initial embeddings dtype: {initial_embeddings.dtype}")
+                logger.info(f"GNN model parameter dtype: {next(gnn_model.parameters()).dtype}")
+                
+                x = initial_embeddings.to(next(gnn_model.parameters()).dtype)
+                logger.info(f"Converted embeddings dtype: {x.dtype}")
+                
+                for i, layer in enumerate(gnn_model.layers):
+                    x = layer(x, edge_index)
+                    if i < len(gnn_model.layers) - 1:
+                        x = F.relu(x)
+                        x = F.dropout(x, p=gnn_model.dropout_p, training=False)
+                final_embeddings = x
+        else:
+            logger.info("NO GNN provided, using initial text-encoder embeddings.")
+            final_embeddings = initial_embeddings
 
     # 3. Save the final indexed corpus.
     pickle.dump(
-        IndexedCorpus(corpus, final_embeddings.to(torch.float32).cpu()),
+        IndexedCorpus(corpus, final_embeddings.cpu()),
         open(args.output_path, "wb"),
     )
     logger.info(f"Indexed corpus saved to {args.output_path}")

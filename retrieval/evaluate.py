@@ -72,6 +72,7 @@ def main() -> None:
 
     for split in ("train", "val", "test"):
         data_path = os.path.join(args.data_path, f"{split}.json")
+        logger.info(f"Loaded data from {data_path}")
         data = json.load(open(data_path))
         logger.info(f"Evaluating on {data_path}")
         R1, R10, MRR = _eval(data, preds_map)

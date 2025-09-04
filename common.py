@@ -235,7 +235,9 @@ class Corpus:
         # Step 3: The final, canonical list of premises is the values of this dict.
         # This list is guaranteed to have unique premises by full_name.
         self.all_premises = list(unique_premises_dict.values())
-        
+        print(f"Removed duplicates: start {len(all_premises_with_duplicates)}")
+        print(f"Removed duplicates: end {len(self.all_premises)}")
+
         # ========================= END OF ROBUST MERGING FIX =========================
         assert nx.is_directed_acyclic_graph(dep_graph)
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
