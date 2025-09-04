@@ -43,3 +43,7 @@ data:
   batch_size: 8 # this was changed
   eval_batch_size: 4
   num_workers: 4
+  signature_edge_type: "verbose"  # Options: "dojo", "clickable", "verbose", null
+  proof_edge_type: True           # Options: True, False
+  all_dojo_edge_type: False       # Options: True, False (overrides the above)
+  context_neighbor_type: "verbose" # Options: "clickable", "verbose"

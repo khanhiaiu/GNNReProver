@@ -83,9 +83,12 @@ class Premise:
     """Raw, human-written code for defining the premise.
     """
 
-    dependencies: List[str] = field(compare=False, default_factory=list)
-    """A list of premises this premise depends on.
-    """
+    # New fields for different dependency types
+    signature_dependencies_dojo: List[str] = field(compare=False, default_factory=list)
+    signature_dependencies_clickable: List[str] = field(compare=False, default_factory=list)
+    signature_dependencies_verbose: List[str] = field(compare=False, default_factory=list)
+    proof_dependencies: List[str] = field(compare=False, default_factory=list)
+    all_dependencies_dojo: List[str] = field(compare=False, default_factory=list)
 
     def __post_init__(self) -> None:
         assert isinstance(self.path, str)
@@ -202,7 +205,12 @@ class Corpus:
     premise_dep_graph: Data
     uid2idx: Dict[Tuple[str, int, int], int]
 
-    def __init__(self, jsonl_path: str) -> None:
+    def __init__(self, 
+            jsonl_path: str,
+            signature_edge_type: Optional[str] = "verbose",
+            proof_edge_type: bool = True,
+            all_dojo_edge_type: bool = False,
+        ) -> None:
         """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
         dep_graph = nx.DiGraph()
         
@@ -223,52 +231,63 @@ class Corpus:
                 all_premises_with_duplicates.extend(file.premises)
 
             for p_import in file_data["imports"]:
-                # The node may not exist yet if the corpus.jsonl is not topologically sorted.
                 if not dep_graph.has_node(p_import):
-                    dep_graph.add_node(p_import, file=None) # Add a placeholder
+                    dep_graph.add_node(p_import, file=None)
                 dep_graph.add_edge(path, p_import)
         
-        # Step 2: Deduplicate premises using a "last-one-wins" strategy.
-        # This creates a canonical mapping from each name to a single Premise object.
         unique_premises_dict = {p.full_name: p for p in all_premises_with_duplicates}
-        
-        # Step 3: The final, canonical list of premises is the values of this dict.
-        # This list is guaranteed to have unique premises by full_name.
         self.all_premises = list(unique_premises_dict.values())
         print(f"Removed duplicates: start {len(all_premises_with_duplicates)}")
         print(f"Removed duplicates: end {len(self.all_premises)}")
+        
 
-        # ========================= END OF ROBUST MERGING FIX =========================
         assert nx.is_directed_acyclic_graph(dep_graph)
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
 
         self.name2idx = {p.full_name: i for i, p in enumerate(self.all_premises)}
-        self._build_premise_dependency_graph()
+        self._build_premise_dependency_graph(
+            signature_edge_type, proof_edge_type, all_dojo_edge_type
+        )
 
         self.imported_premises_cache = {}
         self.fill_cache()
 
-    def _build_premise_dependency_graph(self) -> None:
-        logger.info("Building the premise dependency graph.")
-        edges = []
+    def _build_premise_dependency_graph(
+        self,
+        signature_edge_type: Optional[str],
+        proof_edge_type: bool,
+        all_dojo_edge_type: bool,
+    ) -> None:
+        logger.info(
+            f"Building premise dependency graph with signature_edge_type='{signature_edge_type}', "
+            f"proof_edge_type={proof_edge_type}, all_dojo_edge_type={all_dojo_edge_type}"
+        )
+        edges = set()
         
-        # We now iterate over the original dictionary of unique premises to access dependencies.
-        # This ensures we use the dependency list from the canonical premise object.
         unique_premises_dict = {p.full_name: p for p in self.all_premises}
 
         for p1_name, p1 in unique_premises_dict.items():
-            if p1_name not in self.name2idx: continue
+            if p1_name not in self.name2idx:
+                continue
             p1_idx = self.name2idx[p1_name]
             
-            for p2_name in p1.dependencies:
-                # If a dependency exists in our canonical mapping, create an edge.
+            dependencies_to_add = set()
+            if all_dojo_edge_type:
+                dependencies_to_add.update(p1.all_dependencies_dojo)
+            else:
+                if signature_edge_type:
+                    key = f"signature_dependencies_{signature_edge_type}"
+                    dependencies_to_add.update(getattr(p1, key, []))
+                if proof_edge_type:
+                    dependencies_to_add.update(p1.proof_dependencies)
+
+            for p2_name in dependencies_to_add:
                 if p2_name in self.name2idx:
                     p2_idx = self.name2idx[p2_name]
-                    # Avoid self-loops.
                     if p1_idx != p2_idx:
-                        edges.append((p2_idx, p1_idx))
+                        edges.add((p2_idx, p1_idx))
 
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
         self.premise_dep_graph = Data(edge_index=edge_index, num_nodes=len(self.all_premises))
         logger.info(f"Premise dependency graph: {self.premise_dep_graph}")
 

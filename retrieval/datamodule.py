@@ -39,6 +39,7 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
+        context_neighbor_type: str = "verbose",
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -47,6 +48,7 @@ class RetrievalDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.is_train = is_train
+        self.context_neighbor_type = context_neighbor_type # Store it
         self.data = list(
             itertools.chain.from_iterable(self._load_data(path) for path in data_paths)
         )
@@ -67,12 +69,15 @@ class RetrievalDataset(Dataset):
                 )
                 # BIG TODO: try all, the graph of signatures' premises and proofs' premises and both?
                 before_premises_names = set()
-                if "before_premises" in tac and tac["before_premises"]: # TODO: do we need only the first goal, or all?
-                    for context_premises, goal_premises in tac["before_premises"]:
-                        for p in context_premises:
+                if "before_premises" in tac and tac["before_premises"]:
+                    for goal_data in tac["before_premises"]:
+                        # Use the new parameter to select the verbosity level.
+                        premises_at_level = goal_data.get(self.context_neighbor_type, {})
+                        
+                        for p in premises_at_level.get("lctxPremises", []):
                             if p and p.get("fullName"):
                                 before_premises_names.add(p["fullName"])
-                        for p in goal_premises:
+                        for p in premises_at_level.get("goalPremises", []):
                             if p and p.get("fullName"):
                                 before_premises_names.add(p["fullName"])
 
@@ -223,6 +228,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
+        context_neighbor_type: str = "verbose", # Add parameter
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -233,13 +239,14 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.eval_batch_size = eval_batch_size
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
+        self.context_neighbor_type = context_neighbor_type # Store parameter
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.corpus = Corpus(corpus_path) if corpus_path is not None else None
 
         metadata = json.load(open(os.path.join(data_path, "../metadata.json")))
         repo = LeanGitRepo(**metadata["from_repo"])
-
+    
     def prepare_data(self) -> None:
         pass
 
@@ -255,6 +262,7 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
+            context_neighbor_type=self.context_neighbor_type, # Pass parameter
         )
 
         if stage in (None, "fit", "validate"):
@@ -266,6 +274,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
+                context_neighbor_type=self.context_neighbor_type, # Pass parameter
             )
 
         if stage in (None, "fit", "predict"):
@@ -280,6 +289,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
+                context_neighbor_type=self.context_neighbor_type, # Pass parameter
             )
 
     def train_dataloader(self) -> DataLoader:
