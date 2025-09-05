@@ -162,7 +162,7 @@ class GNNDataModule(pl.LightningDataModule):
                 max_seq_len=0,
                 tokenizer=None,
                 is_train=True,
-                context_neighbor_type=self.context_neighbor_verbosity, , # Pass param
+                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass param
             )
     
     def train_dataloader(self) -> DataLoader:

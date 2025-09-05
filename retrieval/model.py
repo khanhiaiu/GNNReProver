@@ -358,13 +358,6 @@ class PremiseRetriever(pl.LightningModule):
                 context_emb,
                 self.num_retrieved,
             )
-        assert not self.embeddings_staled
-        retrieved_premises, scores = self.corpus.get_nearest_premises(
-            self.corpus_embeddings,
-            batch["context"],
-            context_emb,
-            self.num_retrieved,
-        )
 
         batch_outputs = []
         
