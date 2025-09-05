@@ -17,15 +17,18 @@ from retrieval.gnn_model import GNNRetriever
 from retrieval.gnn_datamodule import GNNDataModule
 
 
+
+class GNNCLI(LightningCLI):
+    def add_arguments_to_parser(self, parser) -> None:
+        # Link the dynamically created mapping from the datamodule's corpus to the model
+        parser.link_arguments("data.corpus.edge_type_to_id", "model.edge_type_to_id")
+
 def main() -> None:
     logger.info(f"PID: {os.getpid()}")
-    cli = LightningCLI(GNNRetriever, GNNDataModule)
+    # Use the new custom CLI class
+    cli = GNNCLI(GNNRetriever, GNNDataModule)
     logger.info(f"Configuration: \n {cli.config}")
 
-
 if __name__ == "__main__":
-    # Set the start method to 'spawn' BEFORE any other torch/CUDA calls.
-    # This is the crucial fix for the "Cannot re-initialize CUDA" error.
-    # It must be in the `if __name__ == "__main__":` block.
     torch.multiprocessing.set_start_method('spawn', force=True)
     main()

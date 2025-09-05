@@ -28,12 +28,6 @@ Batch = Dict[str, Any]
 MARK_START_SYMBOL = "<a>"
 MARK_END_SYMBOL = "</a>"
 
-EDGE_TYPES = {
-    "signature_lctx": 0,
-    "signature_goal": 1,
-    "proof": 2,
-}
-
 def remove_marks(s: str) -> str:
     """Remove all :code:`<a>` and :code:`</a>` from ``s``."""
     return s.replace(MARK_START_SYMBOL, "").replace(MARK_END_SYMBOL, "")
@@ -88,15 +82,7 @@ class Premise:
     """Raw, human-written code for defining the premise.
     """
 
-    # New fields for different dependency types
-    signature_lctx_dependencies: List[str] = field(compare=False, default_factory=list)
-    signature_goal_dependencies: List[str] = field(compare=False, default_factory=list)
-
-    signature_dependencies_dojo: List[str] = field(compare=False, default_factory=list)
-    signature_dependencies_clickable: List[str] = field(compare=False, default_factory=list)
-    signature_dependencies_verbose: List[str] = field(compare=False, default_factory=list)
-    proof_dependencies: List[str] = field(compare=False, default_factory=list)
-    all_dependencies_dojo: List[str] = field(compare=False, default_factory=list)
+    dependencies: List[Tuple[str, str]] = field(compare=False, default_factory=list)
 
     def __post_init__(self) -> None:
         assert isinstance(self.path, str)
@@ -190,14 +176,8 @@ class File:
                     start=Pos(*p["start"]),
                     end=Pos(*p["end"]),
                     code=p["code"],
-                    signature_lctx_dependencies=p.get("signature_lctx_dependencies", []),
-                    signature_goal_dependencies=p.get("signature_goal_dependencies", []),
-                    proof_dependencies=p.get("proof_dependencies", []),
-                    # Assuming other legacy fields might still be loaded from the json
-                    signature_dependencies_dojo=p.get("signature_dependencies_dojo", []),
-                    signature_dependencies_clickable=p.get("signature_dependencies_clickable", []),
-                    signature_dependencies_verbose=p.get("signature_dependencies_verbose", []),
-                    all_dependencies_dojo=p.get("all_dependencies_dojo", []),
+                    # Read from the unified dependencies key
+                    dependencies=p.get("dependencies", []),
                 )
             )
         return cls(path, premises)
@@ -225,12 +205,11 @@ class Corpus:
     dojo_graph : Data
     uid2idx: Dict[Tuple[str, int, int], int]
 
-    def __init__(self, 
-            jsonl_path: str,
-            #signature_edge_type: Optional[str] = "verbose",
-            #proof_edge_type: bool = True,
-            #all_dojo_edge_type: bool = False,
-        ) -> None:
+    def __init__(self, jsonl_path: str, graph_config: Dict[str, Any]) -> None:
+        """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
+        dep_graph = nx.DiGraph()
+        logger.info(f"Building the corpus from {jsonl_path}")
+
         """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
         dep_graph = nx.DiGraph()
         
@@ -265,56 +244,67 @@ class Corpus:
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
 
         self.name2idx = {p.full_name: i for i, p in enumerate(self.all_premises)}
-        self._build_premise_dependency_graphs(
-            #signature_edge_type, proof_edge_type, all_dojo_edge_type
-        )
+        # Pass the config to the graph builder
+        self._build_premise_dependency_graph(graph_config)
 
         self.imported_premises_cache = {}
         self.fill_cache()
 
-    # BIG TODO: we should still use the parameters to decide which edges to use/keep
-    def _build_premise_dependency_graphs(
-        self,
-        # The old arguments are no longer needed for the new logic.
-        # signature_edge_type: Optional[str],
-        # proof_edge_type: bool,
-        # all_dojo_edge_type: bool,
-    ) -> None:
-        logger.info(
-            "Building premise dependency graph with typed edges (lctx, goal, proof)."
-        )
-        edges = []
-        edges_dojo = []
+    def _build_premise_dependency_graph(self, config: Dict[str, Any]) -> None:
+        """Builds the premise dependency graph based on the provided configuration."""
+        logger.info(f"Building premise dependency graph with config: {config}")
         
+        mode = config['mode']
+        edges = []
+        edge_types_map = {}
+        
+        def get_edge_type_id(edge_name):
+            if edge_name not in edge_types_map:
+                edge_types_map[edge_name] = len(edge_types_map)
+            return edge_types_map[edge_name]
 
         for p1 in self.all_premises:
             if p1.full_name not in self.name2idx:
                 continue
             p1_idx = self.name2idx[p1.full_name]
 
-            # Signature Lctx Dependencies
-            for p2_name in p1.signature_lctx_dependencies:
-                if p2_name in self.name2idx and p1_idx != self.name2idx[p2_name]:
-                    edges.append((self.name2idx[p2_name], p1_idx, EDGE_TYPES["signature_lctx"]))
-            
-            # Signature Goal Dependencies
-            for p2_name in p1.signature_goal_dependencies:
-                if p2_name in self.name2idx and p1_idx != self.name2idx[p2_name]:
-                    edges.append((self.name2idx[p2_name], p1_idx, EDGE_TYPES["signature_goal"]))
+            for p2_name, tag in p1.dependencies:
+                if p2_name not in self.name2idx or p1_idx == self.name2idx[p2_name]:
+                    continue
+                p2_idx = self.name2idx[p2_name]
 
-            # Proof Dependencies
-            for p2_name in p1.proof_dependencies:
-                if p2_name in self.name2idx and p1_idx != self.name2idx[p2_name]:
-                    edges.append((self.name2idx[p2_name], p1_idx, EDGE_TYPES["proof"]))
+                # --- Filtering Logic ---
+                edge_type_name = None
+                if mode == 'all_dojo':
+                    if tag == 'all_dojo':
+                        edge_type_name = 'dependency'
+                else: # Custom mode
+                    cfg = config
+                    sig_cfg = cfg['signature_and_state']
+                    
+                    if cfg['use_proof_dependencies'] and tag == 'proof':
+                        edge_type_name = 'proof'
+                    elif 'signature' in tag:
+                        if tag.startswith(f"signature_{sig_cfg['verbosity']}"):
+                            if sig_cfg['distinguish_lctx_goal']:
+                                edge_type_name = tag.replace(f"signature_{sig_cfg['verbosity']}_", 'signature_')
+                            else:
+                                edge_type_name = 'signature'
+                        elif sig_cfg['verbosity'] == 'dojo' and tag == 'signature_dojo':
+                            edge_type_name = 'signature'
+                
+                if edge_type_name:
+                    edge_type_id = get_edge_type_id(edge_type_name)
+                    edges.append((p2_idx, p1_idx, edge_type_id))
+                else:
+                    raise ValueError(f"Edge from {p2_name} to {p1.full_name} with tag {tag} not included by config.")
+        
+        # Store the mapping for the GNN model
+        self.edge_types = {v: k for k, v in edge_types_map.items()}
+        logger.info(f"Final edge types used in graph: {self.edge_types}")
 
-            # update the dojo graph
-            for p2_name in p1.all_dependencies_dojo:
-                if p2_name in self.name2idx and p1_idx != self.name2idx[p2_name]:
-                    edges_dojo.append((self.name2idx[p2_name], p1_idx))
-
-        # Remove duplicate edges (if any) and create tensors
+        # --- Graph Construction ---
         unique_edges = sorted(list(set(edges)))
-        unique_dojo_edges = sorted(list(set(edges_dojo)))
         if not unique_edges:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_attr = torch.empty((0,), dtype=torch.long)
@@ -323,7 +313,6 @@ class Corpus:
             edge_attr = torch.tensor([e[2] for e in unique_edges], dtype=torch.long)
 
         self.premise_dep_graph = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(self.all_premises))
-        self.dojo_graph = Data(edge_index=torch.tensor([[e[0] for e in unique_dojo_edges], [e[1] for e in unique_dojo_edges]], dtype=torch.long), num_nodes=len(self.all_premises))
         logger.info(f"Premise dependency graph: {self.premise_dep_graph}")
 
     def _get_file(self, path: str) -> File:

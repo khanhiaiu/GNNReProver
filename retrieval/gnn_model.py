@@ -23,6 +23,7 @@ class GNNRetriever(pl.LightningModule):
         feature_size: int,
         num_layers: int,
         gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat"
+        edge_type_to_id: Dict[str, int],
         num_relations: int = 3,  # Number of edge types (signature_lctx, signature_goal, proof)
         use_edge_attr: bool = True,  # Whether to use edge attributes
         gat_heads: int = 8,  # Number of attention heads for GAT/RGAT
@@ -35,6 +36,8 @@ class GNNRetriever(pl.LightningModule):
         self.use_edge_attr = use_edge_attr
         self.num_relations = num_relations
         self.gat_heads = gat_heads
+
+        self.edge_type_to_id = edge_type_to_id
 
         # Build GNN layers based on the specified type
         self.layers = nn.ModuleList()
@@ -149,14 +152,14 @@ class GNNRetriever(pl.LightningModule):
             for neighbor_idx in indices:
                 new_edges_src.append(neighbor_idx.item())
                 new_edges_dst.append(ghost_node_idx)
-                new_edge_attrs.append(EDGE_TYPES["signature_lctx"])
+                new_edge_attrs.append(self.edge_type_to_id["signature_lctx"])
 
         for i, indices in enumerate(goal_neighbor_indices):
             ghost_node_idx = num_premises + i
             for neighbor_idx in indices:
                 new_edges_src.append(neighbor_idx.item())
                 new_edges_dst.append(ghost_node_idx)
-                new_edge_attrs.append(EDGE_TYPES["signature_goal"])
+                new_edge_attrs.append(self.edge_type_to_id["signature_goal"])
         
         if new_edges_src:
             new_edges = torch.tensor([new_edges_src, new_edges_dst], dtype=torch.long, device=target_device)

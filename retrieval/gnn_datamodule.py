@@ -126,10 +126,9 @@ class GNNDataModule(pl.LightningDataModule):
         batch_size: int,
         eval_batch_size: int,
         num_workers: int,
-        signature_edge_type: Optional[str] = "verbose", # New param
-        proof_edge_type: bool = True,                   # New param
-        all_dojo_edge_type: bool = False,               # New param
-        context_neighbor_type: str = "verbose",         # New param
+        # Replace old params with the new config dict
+        graph_dependencies: Dict[str, Any],
+        attributes: Dict[str, Any], # Keep for future use
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -138,14 +137,11 @@ class GNNDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.num_workers = num_workers
-        self.context_neighbor_type = context_neighbor_type # Store param
         
         # Pass graph construction params to Corpus
         self.corpus = Corpus(
             corpus_path,
-            signature_edge_type,
-            proof_edge_type,
-            all_dojo_edge_type,
+            graph_dependencies,
         )
         
         with open(embeddings_path, "rb") as f:
@@ -153,7 +149,6 @@ class GNNDataModule(pl.LightningDataModule):
         
         self.node_features = indexed_corpus.embeddings
         self.retriever_ckpt_path = retriever_ckpt_path
-
     
     def setup(self, stage: Optional[str] = None) -> None:
         if stage in (None, "fit"):
