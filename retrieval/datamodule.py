@@ -230,7 +230,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
-        context_neighbor_type: str = "verbose", # Add parameter
+        context_neighbor_verbosity: str = "verbose", # Add parameter
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -241,7 +241,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.eval_batch_size = eval_batch_size
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
-        self.context_neighbor_type = context_neighbor_type # Store parameter
+        self.context_neighbor_verbosity = context_neighbor_verbosity # Store parameter
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.corpus = Corpus(corpus_path) if corpus_path is not None else None
@@ -264,7 +264,7 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
-            context_neighbor_type=self.context_neighbor_type, # Pass parameter
+            context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
         )
 
         if stage in (None, "fit", "validate"):
@@ -276,7 +276,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_type=self.context_neighbor_type, # Pass parameter
+                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
             )
 
         if stage in (None, "fit", "predict"):
@@ -291,7 +291,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_type=self.context_neighbor_type, # Pass parameter
+                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
             )
 
     def train_dataloader(self) -> DataLoader:
