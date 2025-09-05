@@ -33,6 +33,12 @@ model:
   num_layers: 2
   lr: 1e-4
   warmup_steps: 1000
+  gnn_layer_type: rgcn  # Options: "gcn", "rgcn", "gat", "rgat", "gin"
+  hidden_size: 512  # Hidden layer size (default: same as feature_size)
+  use_residual: true  # Whether to use residual/skip connections
+  dropout_p: 0.5  # Dropout probability
+  norm_type: layer  # Normalization type: "none", "batch", "layer", "instance", "group"
+  use_initial_projection: true  # Whether to apply initial projection to embeddings
 
 data:
   data_path: data/leandojo_benchmark_4/random/
