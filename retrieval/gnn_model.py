@@ -15,7 +15,7 @@ import pytorch_lightning as pl
 from typing import Dict, Any, List, Tuple, Optional
 from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv
 
-from common import EDGE_TYPES, _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
+from common import _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
 
 class GNNRetriever(pl.LightningModule):
     def __init__(
@@ -24,49 +24,133 @@ class GNNRetriever(pl.LightningModule):
         num_layers: int,
         graph_dependencies: Dict[str, Any],         # <-- ADD THIS
         context_neighbor_verbosity: str, 
-        gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat", "gin"
         edge_type_to_id: Dict[str, int],
+        lr : float,
+        warmup_steps : int,
+        gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat", "gin"
+        hidden_size: Optional[int] = None,  # Hidden layer size (default: same as feature_size)
         num_relations: int = 3,  # Number of edge types (signature_lctx, signature_goal, proof)
         use_edge_attr: bool = True,  # Whether to use edge attributes
         gat_heads: int = 8,  # Number of attention heads for GAT/RGAT
+        use_residual: bool = True,  # Whether to use residual/skip connections
+        dropout_p: float = 0.5,  # Dropout probability
+        norm_type: str = "layer",  # Normalization type: "none", "batch", "layer", "instance", "group"
+        use_initial_projection: bool = True,  # Whether to apply initial projection to embeddings
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
         
+        self.feature_size = feature_size
+        self.hidden_size = hidden_size if hidden_size is not None else feature_size
+        self.num_layers = num_layers
         self.gnn_layer_type = gnn_layer_type.lower()
         self.use_edge_attr = use_edge_attr
         self.graph_dependencies_config = graph_dependencies
         self.context_neighbor_verbosity = context_neighbor_verbosity
         self.num_relations = num_relations
         self.gat_heads = gat_heads
+        self.use_residual = use_residual
+        self.dropout_p = dropout_p
+        self.norm_type = norm_type.lower() if norm_type else "none"
+        self.use_initial_projection = use_initial_projection
 
         self.edge_type_to_id = edge_type_to_id
 
+        # Initial projection layer (optional)
+        if self.use_initial_projection:
+            self.initial_projection = nn.Linear(feature_size, self.hidden_size)
+        else:
+            self.initial_projection = None
+
+        # Residual projection layer (if hidden_size != feature_size)
+        if self.use_residual and self.hidden_size != feature_size:
+            self.residual_projection = nn.Linear(feature_size, self.hidden_size)
+        else:
+            self.residual_projection = None
+
+        # Final projection layer (to get back to feature_size if needed)
+        if self.hidden_size != feature_size:
+            self.final_projection = nn.Linear(self.hidden_size, feature_size)
+        else:
+            self.final_projection = None
+
+        # Helper method to create normalization layers
+        def create_norm_layer(norm_type: str, num_features: int) -> Optional[nn.Module]:
+            """Create normalization layer based on type."""
+            if norm_type == "batch":
+                return nn.BatchNorm1d(num_features)
+            elif norm_type == "layer":
+                return nn.LayerNorm(num_features)
+            elif norm_type == "instance":
+                return nn.InstanceNorm1d(num_features)
+            elif norm_type == "group":
+                # Use 8 groups by default, ensure it divides num_features
+                num_groups = min(8, num_features)
+                while num_features % num_groups != 0 and num_groups > 1:
+                    num_groups -= 1
+                return nn.GroupNorm(num_groups, num_features)
+            else:  # "none" or invalid
+                return None
+
         # Build GNN layers based on the specified type
         self.layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList() if self.norm_type != "none" else None
+        
+        # Determine input/output sizes for layers
+        input_size = self.hidden_size if use_initial_projection else feature_size
         
         if self.gnn_layer_type == "gcn":
-            for _ in range(num_layers):
-                self.layers.append(GCNConv(feature_size, feature_size))
+            for i in range(num_layers):
+                self.layers.append(GCNConv(input_size, self.hidden_size))
+                if self.norm_type != "none":
+                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
+                    self.norm_layers.append(norm_layer)
+                input_size = self.hidden_size
         elif self.gnn_layer_type == "rgcn":
-            for _ in range(num_layers):
-                self.layers.append(RGCNConv(feature_size, feature_size, num_relations=num_relations))
+            for i in range(num_layers):
+                self.layers.append(RGCNConv(input_size, self.hidden_size, num_relations=num_relations))
+                if self.norm_type != "none":
+                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
+                    self.norm_layers.append(norm_layer)
+                input_size = self.hidden_size
         elif self.gnn_layer_type == "gat":
-            for _ in range(num_layers):
-                # GAT typically concatenates or averages multi-head outputs
-                self.layers.append(GATConv(feature_size, feature_size // gat_heads, heads=gat_heads, concat=False))
+            for i in range(num_layers):
+                # GAT: When concat=False, outputs are averaged across heads
+                # So we need each head to output hidden_size dimensions to get hidden_size output
+                self.layers.append(GATConv(input_size, self.hidden_size, heads=gat_heads, concat=False))
+                if self.norm_type != "none":
+                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
+                    self.norm_layers.append(norm_layer)
+                input_size = self.hidden_size
         elif self.gnn_layer_type == "rgat":
-            for _ in range(num_layers):
-                self.layers.append(RGATConv(feature_size, feature_size // gat_heads, heads=gat_heads, num_relations=num_relations, concat=False))
+            for i in range(num_layers):
+                # RGAT: Same logic as GAT - each head outputs hidden_size dimensions
+                self.layers.append(RGATConv(input_size, self.hidden_size, heads=gat_heads, num_relations=num_relations, concat=False))
+                if self.norm_type != "none":
+                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
+                    self.norm_layers.append(norm_layer)
+                input_size = self.hidden_size
+        elif self.gnn_layer_type == "gin":
+            for i in range(num_layers):
+                # GIN uses an MLP for the neural network component
+                mlp = nn.Sequential(
+                    nn.Linear(input_size, self.hidden_size * 2),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_size * 2, self.hidden_size)
+                )
+                self.layers.append(GINConv(mlp))
+                if self.norm_type != "none":
+                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
+                    self.norm_layers.append(norm_layer)
+                input_size = self.hidden_size
         else:
-            raise ValueError(f"Unsupported GNN layer type: {gnn_layer_type}. Supported types: gcn, rgcn, gat, rgat")
-
-        self.dropout_p = 0.5
+            raise ValueError(f"Unsupported GNN layer type: {gnn_layer_type}. Supported types: gcn, rgcn, gat, rgat, gin")
 
     def _gnn_forward_pass(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """
-        Apply GNN layers with ReLU activation and dropout between layers.
+        Apply GNN layers with optional initial projection, residual connections, 
+        batch normalization, ReLU activation and dropout between layers.
         
         Args:
             x: Input node features
@@ -76,8 +160,18 @@ class GNNRetriever(pl.LightningModule):
         Returns:
             Output node features after passing through all GNN layers
         """
+        # Store original input for residual connection
+        x_orig = x
+        
+        # Apply initial projection if enabled
+        if self.initial_projection is not None:
+            x = self.initial_projection(x)
+        
         for i, layer in enumerate(self.layers):
-            # Apply layer based on type
+            # Store input for potential residual connection
+            x_residual = x
+            
+            # Apply GNN layer based on type
             if self.gnn_layer_type == "gcn":
                 x = layer(x, edge_index)
             elif self.gnn_layer_type == "rgcn":
@@ -96,11 +190,29 @@ class GNNRetriever(pl.LightningModule):
                     # If no edge attributes, use edge type 0 for all edges
                     default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
                     x = layer(x, edge_index, default_edge_attr)
+            elif self.gnn_layer_type == "gin":
+                x = layer(x, edge_index)
+            
+            # Apply normalization if enabled
+            if self.norm_layers is not None and i < len(self.norm_layers):
+                x = self.norm_layers[i](x)
+            
+            # Apply residual connection if enabled and shapes match
+            if self.use_residual and x.shape == x_residual.shape:
+                x = x + x_residual
+            elif self.use_residual and i == 0 and self.residual_projection is not None:
+                # For the first layer, project original input if shapes don't match
+                x = x + self.residual_projection(x_orig)
                     
             # Apply activation and dropout (except for the last layer)
             if i < len(self.layers) - 1:
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
+        
+        # Apply final projection if needed to get back to feature_size
+        if self.final_projection is not None:
+            x = self.final_projection(x)
+        
         return x
 
     def _get_target_device_and_dtype(self) -> Tuple[torch.device, torch.dtype]:
