@@ -71,16 +71,17 @@ class RetrievalDataset(Dataset):
                 lctx_premises_names = set()
                 goal_premises_names = set()
                 if "before_premises" in tac and tac["before_premises"]:
-                    for goal_data in tac["before_premises"]:
-                        # Use the new parameter to select the verbosity level.
-                        premises_at_level = goal_data.get(self.context_neighbor_verbosity, {})
-                        
-                        for p in premises_at_level.get("lctxPremises", []):
-                            if p and p.get("fullName"):
-                                lctx_premises_names.add(p["fullName"])
-                        for p in premises_at_level.get("goalPremises", []):
-                            if p and p.get("fullName"):
-                                goal_premises_names.add(p["fullName"])
+                    # The new format is a list of lists of (premise_name, tag) tuples, one list per goal.
+                    for goal_premises_list in tac["before_premises"]:
+                        for premise_name, tag in goal_premises_list:
+                            # The tag format is like "signature_clickable_lctx" or "signature_verbose_goal".
+                            # We filter based on the desired verbosity level ('clickable' or 'verbose').
+                            # The default is "verbose", which is also a substring of "signature_verbose_lctx", etc.
+                            if self.context_neighbor_verbosity in tag:
+                                if "lctx" in tag:
+                                    lctx_premises_names.add(premise_name)
+                                elif "goal" in tag:
+                                    goal_premises_names.add(premise_name)
 
                 base_example = {
                     "url": thm["url"],
