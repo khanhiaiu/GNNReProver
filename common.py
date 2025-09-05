@@ -268,8 +268,7 @@ class Corpus:
         
         unique_premises_dict = {p.full_name: p for p in all_premises_with_duplicates}
         self.all_premises = list(unique_premises_dict.values())
-        print(f"Removed duplicates: start {len(all_premises_with_duplicates)}")
-        print(f"Removed duplicates: end {len(self.all_premises)}")
+        print(f"Removed duplicates: start {len(all_premises_with_duplicates)} end {len(self.all_premises)}")
         
 
         assert nx.is_directed_acyclic_graph(dep_graph)
