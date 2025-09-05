@@ -177,7 +177,7 @@ class File:
                     end=Pos(*p["end"]),
                     code=p["code"],
                     # Read from the unified dependencies key
-                    dependencies=p.get("dependencies", []),
+                    dependencies=p["dependencies"],
                 )
             )
         return cls(path, premises)
