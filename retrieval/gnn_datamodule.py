@@ -1,4 +1,7 @@
+# retrieval/gnn_datamodule.py
+
 import os
+import torch
 import pickle
 import torch
 
@@ -14,56 +17,34 @@ torch.load = patched_load
 import functools
 import pytorch_lightning as pl
 from loguru import logger
+from tqdm import tqdm
 from typing import Optional, List, Dict, Any
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from common import Corpus, Batch
 from retrieval.model import PremiseRetriever
 from retrieval.datamodule import RetrievalDataset
 
-# Global variable to hold the retriever in each worker process.
-_WORKER_RETRIEVER = None
 
-# Standalone collate function to avoid pickling the DataModule instance.
-@torch.no_grad()
+# The collate function is now simpler. It receives pre-computed embeddings.
 def gnn_collate_fn(
     examples: List[Dict[str, Any]],
     corpus: Corpus,
     node_features: torch.Tensor,
-    retriever_ckpt_path: str,
+    context_embeddings: Dict[str, torch.Tensor], # Receives pre-computed embeddings
     num_negatives: int,
 ) -> Batch:
-    global _WORKER_RETRIEVER
-    
-    # Lazy initialization of the retriever in the worker process.
-    if _WORKER_RETRIEVER is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Initializing retriever in DataLoader worker on device: {device}")
-        _WORKER_RETRIEVER = PremiseRetriever.load_hf(
-            retriever_ckpt_path, 2048, device
-        )
-
     batch = {}
     batch["node_features"] = node_features
     batch["edge_index"] = corpus.premise_dep_graph.edge_index
     batch["edge_attr"] = corpus.premise_dep_graph.edge_attr 
-
-    # Get context embeddings using the worker-local retriever
-    contexts = [ex["context"] for ex in examples]
-    tokenized_contexts = _WORKER_RETRIEVER.tokenizer(
-        [c.serialize() for c in contexts],
-        padding="longest",
-        max_length=_WORKER_RETRIEVER.max_seq_len,
-        truncation=True,
-        return_tensors="pt",
+    
+    # Look up pre-computed embeddings instead of generating them.
+    batch["context_features"] = torch.stack(
+        [context_embeddings[ex["context"].serialize()] for ex in examples]
     )
-    
-    input_ids = tokenized_contexts.input_ids.to(_WORKER_RETRIEVER.encoder.device)
-    attention_mask = tokenized_contexts.attention_mask.to(_WORKER_RETRIEVER.encoder.device)
-    
-    # THE FIX: Move the GPU-generated tensor back to the CPU before returning.
-    batch["context_features"] = _WORKER_RETRIEVER._encode(input_ids, attention_mask).cpu()
 
+    # The rest of the function remains the same...
     lctx_neighbor_indices = []
     for ex in examples:
         indices = [
@@ -119,17 +100,16 @@ class GNNDataModule(pl.LightningDataModule):
         self,
         data_path: str,
         corpus_path: str,
-        embeddings_path: str,
+        premise_embeddings_path: str,
         retriever_ckpt_path: str,
         num_negatives: int,
         num_in_file_negatives: int,
         batch_size: int,
         eval_batch_size: int,
         num_workers: int,
-        # Replace old params with the new config dict
         graph_dependencies: Dict[str, Any],
         context_neighbor_verbosity: str,
-        attributes: Dict[str, Any], # Keep for future use
+        attributes: Dict[str, Any],
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -138,21 +118,32 @@ class GNNDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.num_workers = num_workers
-        self.context_neighbor_verbosity = context_neighbor_verbosity #
+        self.context_neighbor_verbosity = context_neighbor_verbosity
+        self.retriever_ckpt_path = retriever_ckpt_path
+
+        self.corpus = Corpus(corpus_path, graph_dependencies)
+        # Expose edge_types_map at datamodule level for CLI linking
+        self.edge_types_map = self.corpus.edge_types_map
         
-        # Pass graph construction params to Corpus
-        self.corpus = Corpus(
-            corpus_path,
-            graph_dependencies,
-        )
-        
-        with open(embeddings_path, "rb") as f:
+        with open(premise_embeddings_path, "rb") as f:
             indexed_corpus = pickle.load(f)
         
         self.node_features = indexed_corpus.embeddings
-        self.retriever_ckpt_path = retriever_ckpt_path
-    
+        
+        # Define the path for the context embeddings cache.
+        retriever_name = self.retriever_ckpt_path.replace("/", "_")
+        self.context_embeddings_path = os.path.join(self.data_path, f"context_embeddings_{retriever_name}.pt")
+        self.context_embeddings = None
+
     def setup(self, stage: Optional[str] = None) -> None:
+        # Load or generate context embeddings.
+        if os.path.exists(self.context_embeddings_path):
+            logger.info(f"Loading cached context embeddings from {self.context_embeddings_path}")
+            self.context_embeddings = torch.load(self.context_embeddings_path)
+        else:
+            logger.info("Cached context embeddings not found. Generating them now...")
+            self._generate_and_cache_context_embeddings()
+            
         if stage in (None, "fit"):
             self.ds_train = RetrievalDataset(
                 [os.path.join(self.data_path, "train.json")],
@@ -162,22 +153,60 @@ class GNNDataModule(pl.LightningDataModule):
                 max_seq_len=0,
                 tokenizer=None,
                 is_train=True,
-                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass param
+                context_neighbor_verbosity=self.context_neighbor_verbosity,
             )
-    
+            
+    def _generate_and_cache_context_embeddings(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        retriever = PremiseRetriever.load_hf(self.retriever_ckpt_path, 2048, device)
+        
+        # Temporarily create a dataset with all splits to find unique contexts.
+        full_dataset = RetrievalDataset(
+            [os.path.join(self.data_path, f"{split}.json") for split in ("train", "val", "test")],
+            self.corpus, 0, 0, 0, None, is_train=False
+        )
+
+        unique_contexts = {ex["context"].serialize(): None for ex in full_dataset.data}
+        context_list = list(unique_contexts.keys())
+        logger.info(f"Found {len(context_list)} unique contexts to embed.")
+
+        self.context_embeddings = {}
+        batch_size = self.eval_batch_size
+
+        with torch.no_grad():
+            for i in tqdm(range(0, len(context_list), batch_size), desc="Preembedding contexts"):
+                batch_contexts = context_list[i : i + batch_size]
+                tokenized = retriever.tokenizer(
+                    batch_contexts,
+                    padding="longest",
+                    max_length=retriever.max_seq_len,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                input_ids = tokenized.input_ids.to(device)
+                attention_mask = tokenized.attention_mask.to(device)
+                
+                embeddings = retriever._encode(input_ids, attention_mask).cpu()
+
+                for j, context_str in enumerate(batch_contexts):
+                    self.context_embeddings[context_str] = embeddings[j]
+        
+        logger.info(f"Saving context embeddings to {self.context_embeddings_path}")
+        torch.save(self.context_embeddings, self.context_embeddings_path)
+
     def train_dataloader(self) -> DataLoader:
-        collate_fn = functools.partial(
+        collate_fn_with_cache = functools.partial(
             gnn_collate_fn,
             corpus=self.corpus,
             node_features=self.node_features,
-            retriever_ckpt_path=self.retriever_ckpt_path,
+            context_embeddings=self.context_embeddings,
             num_negatives=self.num_negatives,
         )
         return DataLoader(
             self.ds_train,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_cache,
             shuffle=True,
             pin_memory=True,
             drop_last=True,

@@ -70,14 +70,14 @@ class RetrievalDataset(Dataset):
                 
                 lctx_premises_names = set()
                 goal_premises_names = set()
+
                 if "before_premises" in tac and tac["before_premises"]:
-                    # The new format is a list of lists of (premise_name, tag) tuples, one list per goal.
+                    # Each `goal_premises_list` is a list of (premise_name, tag) tuples for one goal.
                     for goal_premises_list in tac["before_premises"]:
                         for premise_name, tag in goal_premises_list:
-                            # The tag format is like "signature_clickable_lctx" or "signature_verbose_goal".
-                            # We filter based on the desired verbosity level ('clickable' or 'verbose').
-                            # The default is "verbose", which is also a substring of "signature_verbose_lctx", etc.
+                            # Filter based on the desired verbosity level ("clickable" or "verbose").
                             if self.context_neighbor_verbosity in tag:
+                                # Distinguish between local context and goal premises.
                                 if "lctx" in tag:
                                     lctx_premises_names.add(premise_name)
                                 elif "goal" in tag:

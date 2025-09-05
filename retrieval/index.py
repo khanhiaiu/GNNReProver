@@ -50,7 +50,16 @@ def main() -> None:
     else:
         device = torch.device("cuda")
 
-    corpus = Corpus(args.corpus_path)
+    default_graph_config = {
+        "mode": "custom",
+        "use_proof_dependencies": True,
+        "signature_and_state": {
+            "verbosity": "verbose",  # Use the most detailed verbosity for the index
+            "distinguish_lctx_goal": True,
+        },
+    }
+
+    corpus = Corpus(args.corpus_path, default_graph_config)
     final_embeddings = None
 
     if args.random_embeddings:
