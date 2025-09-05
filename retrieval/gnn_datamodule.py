@@ -128,6 +128,7 @@ class GNNDataModule(pl.LightningDataModule):
         num_workers: int,
         # Replace old params with the new config dict
         graph_dependencies: Dict[str, Any],
+        context_neighbor_verbosity: str,
         attributes: Dict[str, Any], # Keep for future use
     ) -> None:
         super().__init__()
@@ -137,6 +138,7 @@ class GNNDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.num_workers = num_workers
+        self.context_neighbor_verbosity = context_neighbor_verbosity #
         
         # Pass graph construction params to Corpus
         self.corpus = Corpus(
@@ -160,7 +162,7 @@ class GNNDataModule(pl.LightningDataModule):
                 max_seq_len=0,
                 tokenizer=None,
                 is_train=True,
-                context_neighbor_type=self.context_neighbor_type, # Pass param
+                context_neighbor_type=self.context_neighbor_verbosity, , # Pass param
             )
     
     def train_dataloader(self) -> DataLoader:

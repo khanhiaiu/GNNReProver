@@ -17,11 +17,14 @@ from retrieval.gnn_model import GNNRetriever
 from retrieval.gnn_datamodule import GNNDataModule
 
 
-
 class GNNCLI(LightningCLI):
     def add_arguments_to_parser(self, parser) -> None:
         # Link the dynamically created mapping from the datamodule's corpus to the model
-        parser.link_arguments("data.corpus.edge_type_to_id", "model.edge_type_to_id")
+        parser.link_arguments("data.corpus.edge_types_map", "model.edge_type_to_id")
+        # Link the graph dependency config from data to model
+        parser.link_arguments("data.graph_dependencies", "model.graph_dependencies")
+        # Link the context verbosity level from data to model
+        parser.link_arguments("data.context_neighbor_verbosity", "model.context_neighbor_verbosity") # Changed name from context_neighbor_type
 
 def main() -> None:
     logger.info(f"PID: {os.getpid()}")

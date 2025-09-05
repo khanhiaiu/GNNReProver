@@ -13,16 +13,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Dict, Any, List, Tuple, Optional
-from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv
+from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv
 
-from common import EDGE_TYPES, get_optimizers, load_checkpoint
+from common import EDGE_TYPES, _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
 
 class GNNRetriever(pl.LightningModule):
     def __init__(
         self,
         feature_size: int,
         num_layers: int,
-        gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat"
+        graph_dependencies: Dict[str, Any],         # <-- ADD THIS
+        context_neighbor_verbosity: str, 
+        gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat", "gin"
         edge_type_to_id: Dict[str, int],
         num_relations: int = 3,  # Number of edge types (signature_lctx, signature_goal, proof)
         use_edge_attr: bool = True,  # Whether to use edge attributes
@@ -34,6 +36,8 @@ class GNNRetriever(pl.LightningModule):
         
         self.gnn_layer_type = gnn_layer_type.lower()
         self.use_edge_attr = use_edge_attr
+        self.graph_dependencies_config = graph_dependencies
+        self.context_neighbor_verbosity = context_neighbor_verbosity
         self.num_relations = num_relations
         self.gat_heads = gat_heads
 
@@ -122,45 +126,48 @@ class GNNRetriever(pl.LightningModule):
     ) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor]]:
         """
         Create augmented graph by adding ghost nodes and their connections.
-        
-        Args:
-            node_features: Original node features
-            context_features: Context features (will become ghost nodes)
-            edge_index: Original edge connectivity
-            edge_attr: Original edge attributes
-            neighbor_indices: Lists of neighbor indices for each context
-            
-        Returns:
-            Tuple of (augmented_features, augmented_edge_index, augmented_edge_attr)
         """
         target_device, target_dtype = self._get_target_device_and_dtype()
         num_premises = node_features.shape[0]
         
-        # --- 1. Augment Node Features ---
+        # --- 1. Augment Node Features (no change) ---
         augmented_features = torch.cat(
             [node_features.to(target_device, target_dtype), context_features.to(target_device, target_dtype)], 
             dim=0
         )
 
-        # --- 2. Augment Edges ---
+        # --- 2. Augment Edges using the refactored logic ---
         new_edges_src = []
         new_edges_dst = []
         new_edge_attrs = []
         
-        for i, indices in enumerate(lctx_neighbor_indices):
-            ghost_node_idx = num_premises + i
-            for neighbor_idx in indices:
-                new_edges_src.append(neighbor_idx.item())
-                new_edges_dst.append(ghost_node_idx)
-                new_edge_attrs.append(self.edge_type_to_id["signature_lctx"])
+        # Dynamically create tags based on the configured verbosity
+        lctx_tag = f"signature_{self.context_neighbor_verbosity}_lctx"
+        goal_tag = f"signature_{self.context_neighbor_verbosity}_goal"
 
-        for i, indices in enumerate(goal_neighbor_indices):
-            ghost_node_idx = num_premises + i
-            for neighbor_idx in indices:
-                new_edges_src.append(neighbor_idx.item())
-                new_edges_dst.append(ghost_node_idx)
-                new_edge_attrs.append(self.edge_type_to_id["signature_goal"])
-        
+        # Determine edge types using the common helper function
+        lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
+        goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
+
+        if lctx_edge_name and lctx_edge_name in self.edge_type_to_id:
+            lctx_edge_type_id = self.edge_type_to_id[lctx_edge_name]
+            for i, indices in enumerate(lctx_neighbor_indices):
+                ghost_node_idx = num_premises + i
+                for neighbor_idx in indices:
+                    new_edges_src.append(neighbor_idx.item())
+                    new_edges_dst.append(ghost_node_idx)
+                    new_edge_attrs.append(lctx_edge_type_id)
+
+        if goal_edge_name and goal_edge_name in self.edge_type_to_id:
+            goal_edge_type_id = self.edge_type_to_id[goal_edge_name]
+            for i, indices in enumerate(goal_neighbor_indices):
+                ghost_node_idx = num_premises + i
+                for neighbor_idx in indices:
+                    new_edges_src.append(neighbor_idx.item())
+                    new_edges_dst.append(ghost_node_idx)
+                    new_edge_attrs.append(goal_edge_type_id)
+
+        # The rest of the function remains the same...
         if new_edges_src:
             new_edges = torch.tensor([new_edges_src, new_edges_dst], dtype=torch.long, device=target_device)
             augmented_edge_index = torch.cat([edge_index.to(target_device), new_edges], dim=1)

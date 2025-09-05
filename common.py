@@ -188,6 +188,38 @@ class File:
         return self.premises == []
 
 
+def _get_edge_type_name_from_tag(tag: str, config: Dict[str, Any]) -> Optional[str]:
+    """
+    Determines the edge type name based on a dependency tag and a configuration dictionary.
+    Returns None if the edge should be filtered out.
+    """
+    mode = config.get('mode', 'custom')
+    edge_type_name = None
+
+    if mode == 'all_dojo':
+        if tag == 'all_dojo':
+            edge_type_name = 'dependency'
+    else:  # Custom mode
+        sig_cfg = config.get('signature_and_state', {})
+        verbosity = sig_cfg.get('verbosity', 'verbose')
+        distinguish = sig_cfg.get('distinguish_lctx_goal', False)
+        use_proof = config.get('use_proof_dependencies', False)
+
+        if use_proof and tag == 'proof':
+            edge_type_name = 'proof'
+        elif 'signature' in tag:
+            if tag.startswith(f"signature_{verbosity}"):
+                if distinguish:
+                    # e.g., from "signature_clickable_lctx" get "signature_lctx"
+                    edge_type_name = tag.replace(f"signature_{verbosity}_", 'signature_')
+                else:
+                    edge_type_name = 'signature'
+            elif verbosity == 'dojo' and tag == 'signature_dojo':
+                edge_type_name = 'signature'
+    
+    return edge_type_name
+
+
 class Corpus:
     """Our retrieval corpus is a DAG of files. Each file consists of
     premises (theorems, definitoins, etc.) that can be retrieved.
@@ -254,7 +286,6 @@ class Corpus:
         """Builds the premise dependency graph based on the provided configuration."""
         logger.info(f"Building premise dependency graph with config: {config}")
         
-        mode = config['mode']
         edges = []
         edge_types_map = {}
         
@@ -273,33 +304,15 @@ class Corpus:
                     continue
                 p2_idx = self.name2idx[p2_name]
 
-                # --- Filtering Logic ---
-                edge_type_name = None
-                if mode == 'all_dojo':
-                    if tag == 'all_dojo':
-                        edge_type_name = 'dependency'
-                else: # Custom mode
-                    cfg = config
-                    sig_cfg = cfg['signature_and_state']
-                    
-                    if cfg['use_proof_dependencies'] and tag == 'proof':
-                        edge_type_name = 'proof'
-                    elif 'signature' in tag:
-                        if tag.startswith(f"signature_{sig_cfg['verbosity']}"):
-                            if sig_cfg['distinguish_lctx_goal']:
-                                edge_type_name = tag.replace(f"signature_{sig_cfg['verbosity']}_", 'signature_')
-                            else:
-                                edge_type_name = 'signature'
-                        elif sig_cfg['verbosity'] == 'dojo' and tag == 'signature_dojo':
-                            edge_type_name = 'signature'
+                # --- REFACTORED LOGIC ---
+                edge_type_name = _get_edge_type_name_from_tag(tag, config)
                 
                 if edge_type_name:
                     edge_type_id = get_edge_type_id(edge_type_name)
                     edges.append((p2_idx, p1_idx, edge_type_id))
-                else:
-                    raise ValueError(f"Edge from {p2_name} to {p1.full_name} with tag {tag} not included by config.")
-        
+
         # Store the mapping for the GNN model
+        self.edge_types_map = edge_types_map  # Changed name for clarity
         self.edge_types = {v: k for k, v in edge_types_map.items()}
         logger.info(f"Final edge types used in graph: {self.edge_types}")
 

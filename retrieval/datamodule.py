@@ -39,7 +39,7 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
-        context_neighbor_type: str = "verbose",
+        context_neighbor_verbosity: str = "verbose",
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -48,7 +48,7 @@ class RetrievalDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.is_train = is_train
-        self.context_neighbor_type = context_neighbor_type # Store it
+        self.context_neighbor_verbosity = context_neighbor_verbosity # Store it
         self.data = list(
             itertools.chain.from_iterable(self._load_data(path) for path in data_paths)
         )
@@ -73,7 +73,7 @@ class RetrievalDataset(Dataset):
                 if "before_premises" in tac and tac["before_premises"]:
                     for goal_data in tac["before_premises"]:
                         # Use the new parameter to select the verbosity level.
-                        premises_at_level = goal_data.get(self.context_neighbor_type, {})
+                        premises_at_level = goal_data.get(self.context_neighbor_verbosity, {})
                         
                         for p in premises_at_level.get("lctxPremises", []):
                             if p and p.get("fullName"):
