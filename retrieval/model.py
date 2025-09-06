@@ -415,11 +415,13 @@ class PremiseRetriever(pl.LightningModule):
         return batch_outputs
 
     def on_predict_epoch_end(self) -> None:
+
         if self.trainer.log_dir is not None:
-            path = os.path.join(self.trainer.log_dir, "predictions.pickle")
-            with open(path, "wb") as oup:
-                pickle.dump(self.predict_step_outputs, oup)
-            logger.info(f"Retrieval predictions saved to {path}")
+            # We save separately in main.py now
+            #path = os.path.join(self.trainer.log_dir, "predictions.pickle")
+            #with open(path, "wb") as oup:
+            #    pickle.dump(self.predict_step_outputs, oup)
+            #logger.info(f"Retrieval predictions saved to {path}")
 
             self.predict_step_outputs.clear()
 
