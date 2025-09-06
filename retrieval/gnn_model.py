@@ -228,7 +228,7 @@ class GNNRetriever(pl.LightningModule):
             param = next(first_layer.parameters())
             return param.device, param.dtype
 
-    def _create_augmented_graph(
+    def _create_augmented_graph_full(
         self, 
         node_features: torch.FloatTensor, 
         context_features: torch.FloatTensor, 
@@ -355,7 +355,7 @@ class GNNRetriever(pl.LightningModule):
         num_premises = node_features.shape[0]
 
         # --- 1. Create Augmented Graph ---
-        augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph(
+        augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
             
@@ -420,7 +420,7 @@ class GNNRetriever(pl.LightningModule):
         )
     
     @torch.no_grad()
-    def get_dynamic_context_embedding(
+    def get_dynamic_context_embeddingOLD(
         self,
         initial_context_embs: torch.FloatTensor,
         batch_lctx_neighbor_indices: List[torch.LongTensor],
@@ -463,5 +463,168 @@ class GNNRetriever(pl.LightningModule):
         else:
             final_premise_embs = gnn_premise_embs
             final_context_embs = gnn_context_embs
+        
+        return final_context_embs, final_premise_embs
+    
+        @torch.no_grad()
+    def get_dynamic_context_embedding(
+        self,
+        initial_context_embs: torch.FloatTensor,
+        batch_lctx_neighbor_indices: List[torch.LongTensor],
+        batch_goal_neighbor_indices: List[torch.LongTensor],
+        initial_node_features: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+        edge_attr: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """
+        Computes final context and premise embeddings efficiently for inference.
+
+        This method avoids creating a full augmented graph. It works by:
+        1. Pre-computing the final embeddings for all existing premise nodes.
+        2. Iteratively computing the embeddings for the new context (ghost) nodes,
+           layer by layer, using the pre-computed intermediate premise embeddings
+           at each step.
+        """
+        self.eval()
+        num_premises = initial_node_features.shape[0]
+
+        # --- 1. Efficient Premise Pass: Pre-compute all layers for existing nodes ---
+        # We run the standard forward pass ONLY on the original graph.
+        final_premise_embs = self.forward_embeddings(initial_node_features, edge_index, edge_attr)
+
+        # --- 2. Efficient Context Pass: Iteratively compute ghost node embeddings ---
+        # Store intermediate premise embeddings needed for each GNN layer
+        intermediate_premise_embs = []
+        x_premise = initial_node_features
+        if self.initial_projection is not None:
+            x_premise = self.initial_projection(x_premise)
+        intermediate_premise_embs.append(x_premise) # Embs before layer 0
+
+        for i, layer in enumerate(self.layers):
+            x_residual = x_premise # For residual connection
+            
+            # Get premise embeddings after this layer
+            if self.gnn_layer_type in ["gcn", "gat", "gin"]:
+                x_premise = layer(x_premise, edge_index)
+            else: # rgcn, rgat
+                x_premise = layer(x_premise, edge_index, edge_attr)
+            
+            if self.norm_layers is not None:
+                x_premise = self.norm_layers[i](x_premise)
+            
+            if self.use_residual and x_premise.shape == x_residual.shape:
+                 x_premise = x_premise + x_residual
+            
+            if i < len(self.layers) - 1:
+                x_premise = F.relu(x_premise)
+                # No dropout in eval mode
+            
+            intermediate_premise_embs.append(x_premise) # Embs after layer i
+
+        # Combine local context and goal neighbors into a single list for ghost nodes
+        # Assuming len(lctx) == len(goal) == num_ghost_nodes
+        all_neighbor_indices = [
+            torch.cat([lctx, goal])
+            for lctx, goal in zip(batch_lctx_neighbor_indices, batch_goal_neighbor_indices)
+        ]
+
+        # Start with the initial context embeddings
+        x_context = initial_context_embs
+        if self.initial_projection is not None:
+            x_context = self.initial_projection(x_context)
+
+        # Now, iterate through layers for the context, using the pre-computed premise embs
+        for i, layer in enumerate(self.layers):
+            x_context_residual = x_context
+
+            # Get the correct intermediate premise embeddings for this layer
+            premise_embs_for_layer = intermediate_premise_embs[i]
+            
+            # Dispatch to the correct efficient function based on layer type
+            if isinstance(layer, GCNConv):
+                x_context = compute_ghost_node_embeddings(
+                    layer, premise_embs_for_layer, list(x_context), all_neighbor_indices,
+                    original_edge_index=edge_index
+                )
+            elif isinstance(layer, RGCNConv):
+                # We need to construct the (sources, types) tuples for RGCN
+                lctx_tag = f"signature_{self.context_neighbor_verbosity}_lctx"
+                goal_tag = f"signature_{self.context_neighbor_verbosity}_goal"
+                lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
+                goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
+                lctx_edge_type_id = self.edge_type_to_id[lctx_edge_name]
+                goal_edge_type_id = self.edge_type_to_id[goal_edge_name]
+
+                connections = []
+                for lctx_n, goal_n in zip(batch_lctx_neighbor_indices, batch_goal_neighbor_indices):
+                    sources = torch.cat([lctx_n, goal_n])
+                    types = torch.cat([
+                        torch.full_like(lctx_n, lctx_edge_type_id),
+                        torch.full_like(goal_n, goal_edge_type_id)
+                    ])
+                    connections.append((sources, types))
+
+                x_context = compute_ghost_node_embeddings_rgcn(
+                    layer, premise_embs_for_layer, list(x_context), connections
+                )
+            elif isinstance(layer, GATConv):
+                x_context = compute_ghost_node_embeddings_gat(
+                    layer, premise_embs_for_layer, list(x_context), all_neighbor_indices
+                )
+            elif isinstance(layer, RGATConv):
+                # Similar connection formatting as RGCN
+                lctx_tag = f"signature_{self.context_neighbor_verbosity}_lctx"
+                goal_tag = f"signature_{self.context_neighbor_verbosity}_goal"
+                lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
+                goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
+                lctx_edge_type_id = self.edge_type_to_id[lctx_edge_name]
+                goal_edge_type_id = self.edge_type_to_id[goal_edge_name]
+
+                connections = []
+                for lctx_n, goal_n in zip(batch_lctx_neighbor_indices, batch_goal_neighbor_indices):
+                    sources = torch.cat([lctx_n, goal_n])
+                    types = torch.cat([
+                        torch.full_like(lctx_n, lctx_edge_type_id),
+                        torch.full_like(goal_n, goal_edge_type_id)
+                    ])
+                    connections.append((sources, types))
+
+                x_context = compute_ghost_node_embeddings_rgat(
+                    layer, premise_embs_for_layer, list(x_context), connections
+                )
+            elif isinstance(layer, GINConv):
+                x_context = compute_ghost_node_embeddings_gin(
+                    layer, premise_embs_for_layer, list(x_context), all_neighbor_indices
+                )
+            
+            # Apply post-layer operations, just like in the standard forward pass
+            if self.norm_layers is not None:
+                x_context = self.norm_layers[i](x_context)
+
+            if self.use_residual and x_context.shape == x_context_residual.shape:
+                x_context = x_context + x_context_residual
+            
+            if i < len(self.layers) - 1:
+                x_context = F.relu(x_context)
+        
+        # This is the final context embedding after all layers
+        final_context_embs = x_context
+        if self.final_projection is not None:
+            # We already applied the projection to premises in forward_embeddings
+            final_context_embs = self.final_projection(final_context_embs)
+        
+        # --- 3. Final Processing (Normalization and optional concatenation) ---
+        final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
+        final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+        
+        if self.hparams.concat_with_original_embeddings:
+            original_premise_embs = F.normalize(initial_node_features.to(final_premise_embs.device), p=2, dim=1)
+            original_context_embs = F.normalize(initial_context_embs.to(final_context_embs.device), p=2, dim=1)
+
+            final_premise_embs = torch.cat([final_premise_embs, original_premise_embs], dim=1)
+            final_context_embs = torch.cat([final_context_embs, original_context_embs], dim=1)
+            
+            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
+            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
         
         return final_context_embs, final_premise_embs
