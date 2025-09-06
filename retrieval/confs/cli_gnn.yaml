@@ -4,7 +4,7 @@ seed_everything: 3407
 trainer:
   accelerator: gpu
   devices: 1
-  precision: bf16-mixed
+  precision: 32-true # future TODO
   strategy:
     class_path: pytorch_lightning.strategies.DeepSpeedStrategy
     init_args:
@@ -40,6 +40,8 @@ model:
   dropout_p: 0.5  # Dropout probability
   norm_type: layer  # Normalization type: "none", "batch", "layer", "instance", "group"
   use_initial_projection: true  # Whether to apply initial projection to embeddings
+  concat_with_original_embeddings: true # <-- ADD THIS LINE
+
 
 data:
   data_path: data/leandojo_benchmark_4/random/
@@ -48,9 +50,9 @@ data:
   retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
   num_negatives: 3
   num_in_file_negatives: 1
-  batch_size: 8
+  batch_size: 16
   eval_batch_size: 4
-  num_workers: 4
+  num_workers: 4 
   
   # New parametrization scheme for graph construction
   graph_dependencies:
@@ -61,7 +63,7 @@ data:
       distinguish_lctx_goal: true
   
   # Context neighbor verbosity level
-  context_neighbor_verbosity: 'clickable' # TODO: why is this separate from above?
+  context_neighbor_verbosity: 'clickable'
 
   attributes:
     use_node_attributes: true      # This key is not used in the GNN model yet but is good practice to include

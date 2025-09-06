@@ -36,6 +36,7 @@ class GNNRetriever(pl.LightningModule):
         dropout_p: float = 0.5,  # Dropout probability
         norm_type: str = "layer",  # Normalization type: "none", "batch", "layer", "instance", "group"
         use_initial_projection: bool = True,  # Whether to apply initial projection to embeddings
+        concat_with_original_embeddings: bool = False, 
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -361,10 +362,27 @@ class GNNRetriever(pl.LightningModule):
         # --- 2. Single GNN Pass on Augmented Graph ---
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
         
-        # --- 3. Extract and Normalize Final Embeddings ---
-        final_premise_embs, final_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
+        # --- 3. Extract and Normalize GNN Embeddings ---
+        gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
-        # --- 4. Contrastive Loss Calculation ---
+        # --- 4. (Optional) Concatenate with Original Embeddings ---
+        if self.hparams.concat_with_original_embeddings:
+            # Ensure original features are on the correct device and normalized
+            original_premise_embs = F.normalize(node_features.to(gnn_premise_embs.device), p=2, dim=1)
+            original_context_embs = F.normalize(context_features.to(gnn_context_embs.device), p=2, dim=1)
+
+            # Concatenate GNN-processed and original embeddings
+            final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
+            final_context_embs = torch.cat([gnn_context_embs, original_context_embs], dim=1)
+
+            # CRITICAL: Re-normalize the concatenated vectors before similarity calculation
+            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
+            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+        else:
+            final_premise_embs = gnn_premise_embs
+            final_context_embs = gnn_context_embs
+
+        # --- 5. Contrastive Loss Calculation ---
         pos_premise_emb = final_premise_embs[pos_premise_indices]
         neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
         
@@ -426,7 +444,24 @@ class GNNRetriever(pl.LightningModule):
         # Single GNN pass
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
 
-        # Extract and normalize final embeddings
-        final_premise_embs, final_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
+        # Extract and normalize GNN embeddings
+        gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
+        
+        # (Optional) Concatenate with Original Embeddings
+        if self.hparams.concat_with_original_embeddings:
+            # Ensure original features are on the correct device and normalized
+            original_premise_embs = F.normalize(initial_node_features.to(gnn_premise_embs.device), p=2, dim=1)
+            original_context_embs = F.normalize(initial_context_embs.to(gnn_context_embs.device), p=2, dim=1)
+
+            # Concatenate
+            final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
+            final_context_embs = torch.cat([gnn_context_embs, original_context_embs], dim=1)
+            
+            # Re-normalize the concatenated vectors
+            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
+            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+        else:
+            final_premise_embs = gnn_premise_embs
+            final_context_embs = gnn_context_embs
         
         return final_context_embs, final_premise_embs

@@ -58,7 +58,7 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 
 # Create a highly descriptive experiment name and log directory.
 EXP_NAME="${UNIQUE_NAME_TAG}_${NUM_LAYERS}layers_${SPLIT_TYPE}"
-LOG_DIR="lightning_logs/2025-08-30_${EXP_NAME}" # TODO
+LOG_DIR="lightning_logs/$(date +%Y-%m-%d)_${EXP_NAME}"
 
 # Define paths based on the chosen split
 DATA_PATH="data/leandojo_benchmark_4/${SPLIT_TYPE}"
