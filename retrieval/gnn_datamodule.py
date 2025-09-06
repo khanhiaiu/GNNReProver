@@ -39,10 +39,14 @@ def gnn_collate_fn(
     batch["edge_index"] = corpus.premise_dep_graph.edge_index
     batch["edge_attr"] = corpus.premise_dep_graph.edge_attr 
     
+    # Add the context object itself to the batch for logging purposes
+    batch["context"] = [ex["context"] for ex in examples]
+
     # Look up pre-computed embeddings instead of generating them.
     batch["context_features"] = torch.stack(
         [context_embeddings[ex["context"].serialize()] for ex in examples]
     )
+
 
     # The rest of the function remains the same...
     lctx_neighbor_indices = []

@@ -17,26 +17,29 @@ from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv
 
 from common import _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
 
+from loguru import logger
+
 class GNNRetriever(pl.LightningModule):
     def __init__(
         self,
         feature_size: int,
         num_layers: int,
-        graph_dependencies: Dict[str, Any],         # <-- ADD THIS
+        graph_dependencies: Dict[str, Any],
         context_neighbor_verbosity: str, 
         edge_type_to_id: Dict[str, int],
         lr : float,
         warmup_steps : int,
-        gnn_layer_type: str = "rgcn",  # Options: "gcn", "rgcn", "gat", "rgat", "gin"
-        hidden_size: Optional[int] = None,  # Hidden layer size (default: same as feature_size)
-        num_relations: int = 3,  # Number of edge types (signature_lctx, signature_goal, proof)
-        use_edge_attr: bool = True,  # Whether to use edge attributes
-        gat_heads: int = 8,  # Number of attention heads for GAT/RGAT
-        use_residual: bool = True,  # Whether to use residual/skip connections
-        dropout_p: float = 0.5,  # Dropout probability
-        norm_type: str = "layer",  # Normalization type: "none", "batch", "layer", "instance", "group"
-        use_initial_projection: bool = True,  # Whether to apply initial projection to embeddings
-        concat_with_original_embeddings: bool = False, 
+        gnn_layer_type: str = "rgcn",
+        hidden_size: Optional[int] = None,
+        num_relations: int = 3,
+        use_edge_attr: bool = True,
+        gat_heads: int = 8,
+        use_residual: bool = True,
+        dropout_p: float = 0.5,
+        norm_type: str = "layer",
+        use_initial_projection: bool = True,
+        concat_with_original_embeddings: bool = False,
+        num_logs_per_epoch: int = 5,  # <-- ADD THIS NEW PARAMETER
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -393,7 +396,90 @@ class GNNRetriever(pl.LightningModule):
         loss = F.mse_loss(similarity, label)
         return loss
 
-    def training_step(self, batch: Dict[str, Any], _) -> torch.Tensor:
+    def on_train_epoch_start(self) -> None:
+        """Calculate and store the batch indices for logging in this epoch."""
+        if not self.trainer or not hasattr(self.trainer, 'train_dataloader'):
+            self.logging_steps = []
+            return
+
+        total_batches = len(self.trainer.train_dataloader)
+        if total_batches == 0:
+            self.logging_steps = []
+            return
+            
+        num_logs = self.hparams.num_logs_per_epoch
+        if num_logs <= 0:
+            self.logging_steps = []
+            return
+
+        # Ensure we don't log more times than there are batches
+        if num_logs > total_batches:
+            num_logs = total_batches
+
+        # Calculate evenly spaced logging steps, ensuring the last batch is included
+        interval = total_batches // num_logs
+        self.logging_steps = [(i * interval) for i in range(1, num_logs)]
+        self.logging_steps.append(total_batches - 1) # Log on the very last batch
+        self.logging_steps = sorted(list(set(self.logging_steps))) # Ensure uniqueness and order
+
+        logger.info(f"Epoch {self.current_epoch}: Will log training samples at batch indices: {self.logging_steps}")
+
+    @torch.no_grad()
+    def _log_training_sample(self, batch: Dict[str, Any], batch_idx: int):
+        """Logs a single sample from the batch for inspection during training."""
+        self.eval()  # Set to eval mode for logging to disable dropout etc.
+
+        # 1. Log State/Goal Text and Ingoing Edges
+        context_text = batch["context"][0].serialize()
+        lctx_indices = batch["lctx_neighbor_indices"][0]
+        goal_indices = batch["goal_neighbor_indices"][0]
+        corpus = self.trainer.datamodule.corpus
+
+        logger.info(f"\n--- Training Sample Log (Epoch: {self.current_epoch}, Batch: {batch_idx}, Global Step: {self.global_step}) ---")
+        logger.info(f"State/Goal Text: \n{context_text}")
+        logger.info("  Ingoing Edges to Ghost Node:")
+        for idx in lctx_indices:
+            premise_name = corpus.all_premises[idx.item()].full_name
+            logger.info(f"    <- [lctx] <- {premise_name}")
+        for idx in goal_indices:
+            premise_name = corpus.all_premises[idx.item()].full_name
+            logger.info(f"    <- [goal] <- {premise_name}")
+
+        # 2. Log Embeddings (Before and After GNN)
+        initial_context_emb = batch["context_features"][0]
+        logger.info(f"  Initial Context Embedding (first 8 values): {initial_context_emb[:8].cpu().numpy()}")
+
+        # Re-run forward pass logic for this single sample to get the final embedding
+        num_premises = batch["node_features"].shape[0]
+        aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
+            batch["node_features"],
+            batch["context_features"][[0]],  # Select the first context
+            batch["edge_index"],
+            batch.get("edge_attr"),
+            [batch["lctx_neighbor_indices"][0]],
+            [batch["goal_neighbor_indices"][0]],
+        )
+        x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
+        _, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
+        final_context_emb = gnn_context_embs[0]
+
+        if self.hparams.concat_with_original_embeddings:
+            original_context_emb = F.normalize(initial_context_emb.unsqueeze(0).to(final_context_emb.device), p=2, dim=1)
+            concatenated_emb = torch.cat([final_context_emb.unsqueeze(0), original_context_emb], dim=1)
+            final_context_emb = F.normalize(concatenated_emb, p=2, dim=1).squeeze(0)
+
+        logger.info(f"  Final GNN Context Embedding (first 8 values):   {final_context_emb[:8].cpu().numpy()}")
+        logger.info("--- End of Training Sample Log ---")
+        
+        self.train()  # Switch back to train mode
+
+    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+        # Periodically log a sample from the batch based on pre-calculated steps.
+        # The batch_idx is provided by Lightning and tracks the index within the current epoch.
+        if hasattr(self, "logging_steps") and batch_idx in self.logging_steps:
+            if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
+                self._log_training_sample(batch, batch_idx)
+
         loss = self(
             batch["node_features"],
             batch["edge_index"],
