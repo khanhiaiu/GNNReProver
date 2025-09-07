@@ -46,7 +46,6 @@ model:
 data:
   data_path: data/leandojo_benchmark_4/random/
   corpus_path: data/leandojo_benchmark_4/corpus.jsonl
-  premise_embeddings_path: data/leandojo_benchmark_4/embeddings/premise_embeddings.pt # IMPORTANT: Set this path
   retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
   num_negatives: 3
   num_in_file_negatives: 1

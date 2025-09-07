@@ -37,25 +37,12 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load the GNN-refined corpus (contains static premise embeddings).
-    with open(args.indexed_corpus_path, "rb") as f:
-        indexed_corpus = pickle.load(f)
-
-    # 2. Load the main PremiseRetriever (the text encoder).
     retriever = PremiseRetriever.load_hf(args.retriever_ckpt_path, 2048, device)
-    retriever.corpus = indexed_corpus.corpus
-    retriever.corpus_embeddings = indexed_corpus.embeddings.to(device)
-    retriever.embeddings_staled = False
+    
+    logger.info(f"Loading GNN from {args.gnn_ckpt_path} for dynamic retrieval.")
+    gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
+    retriever.gnn_model = gnn_model
 
-    # 3. If a GNN checkpoint is provided, load it for dynamic retrieval.
-    if args.gnn_ckpt_path:
-        logger.info(f"Loading GNN from {args.gnn_ckpt_path} for dynamic retrieval.")
-        gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
-        retriever.gnn_model = gnn_model
-    else:
-        logger.info("No GNN checkpoint provided. Performing static retrieval.")
-
-    # 4. Set up the datamodule to feed data to the retriever.
     datamodule = RetrievalDataModule(
         data_path=args.data_path,
         corpus_path=None, # Not needed, corpus is in retriever
@@ -71,7 +58,6 @@ def main() -> None:
     datamodule.corpus = retriever.corpus
     datamodule.setup("predict")  # Explicitly setup datasets now that corpus is available
 
-    # 5. Run prediction.
     trainer = pl.Trainer(
         accelerator="auto",
         devices=1,

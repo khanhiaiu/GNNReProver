@@ -104,7 +104,6 @@ class GNNDataModule(pl.LightningDataModule):
         self,
         data_path: str,
         corpus_path: str,
-        premise_embeddings_path: str,
         retriever_ckpt_path: str,
         num_negatives: int,
         num_in_file_negatives: int,
@@ -129,17 +128,27 @@ class GNNDataModule(pl.LightningDataModule):
         # Expose edge_types_map at datamodule level for CLI linking
         self.edge_types_map = self.corpus.edge_types_map
         
-        with open(premise_embeddings_path, "rb") as f:
-            indexed_corpus = pickle.load(f)
-        
-        self.node_features = indexed_corpus.embeddings
+        # --- FIX: Define retriever_name before using it ---
+        retriever_name = self.retriever_ckpt_path.replace("/", "_")
+
+        self.premise_embeddings_path = os.path.join(
+            os.path.dirname(corpus_path), f"premise_embeddings_{retriever_name}.pt"
+        )
+        self.node_features = None
         
         # Define the path for the context embeddings cache.
-        retriever_name = self.retriever_ckpt_path.replace("/", "_")
         self.context_embeddings_path = os.path.join(self.data_path, f"context_embeddings_{retriever_name}.pt")
         self.context_embeddings = None
 
     def setup(self, stage: Optional[str] = None) -> None:
+        # Load or generate PREMISE embeddings
+        if os.path.exists(self.premise_embeddings_path):
+            logger.info(f"Loading cached premise embeddings from {self.premise_embeddings_path}")
+            self.node_features = torch.load(self.premise_embeddings_path)
+        else:
+            logger.info("Cached premise embeddings not found. Generating them now...")
+            self._generate_and_cache_premise_embeddings()
+
         # Load or generate context embeddings.
         if os.path.exists(self.context_embeddings_path):
             logger.info(f"Loading cached context embeddings from {self.context_embeddings_path}")
@@ -159,6 +168,19 @@ class GNNDataModule(pl.LightningDataModule):
                 is_train=True,
                 context_neighbor_verbosity=self.context_neighbor_verbosity,
             )
+
+    def _generate_and_cache_premise_embeddings(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        retriever = PremiseRetriever.load_hf(self.retriever_ckpt_path, 2048, device)
+        retriever.load_corpus(self.corpus)
+        
+        logger.info("Generating initial premise embeddings for GNN training...")
+        # This reuses the same robust logic from the PremiseRetriever class
+        retriever.reindex_corpus(batch_size=self.eval_batch_size)
+        self.node_features = retriever.corpus_embeddings.cpu()
+
+        logger.info(f"Saving premise embeddings to {self.premise_embeddings_path}")
+        torch.save(self.node_features, self.premise_embeddings_path)
             
     def _generate_and_cache_context_embeddings(self) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

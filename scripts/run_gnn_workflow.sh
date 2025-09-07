@@ -73,7 +73,7 @@ PREDICTIONS_PATH="${LOG_DIR}/predictions_dynamic.pickle"
 
 # --- 3. Run Training ---
 echo
-echo "--- STEP 1 of 4: TRAINING GNN RETRIEVER ---"
+echo "--- STEP 1 of 3: TRAINING GNN RETRIEVER ---"
 echo "Logs and checkpoints will be saved to: $LOG_DIR"
 echo "Using data from: $DATA_PATH/"
 echo "W&B Run Name will be: $EXP_NAME"
@@ -106,25 +106,9 @@ GNN_CHECKPOINT_PATH=$(echo "$GNN_CHECKPOINT_PATH" | head -n 1)
 echo "Found checkpoint: $GNN_CHECKPOINT_PATH"
 
 
-# --- 4. Create GNN-Enhanced Index ---
-echo
-echo "--- STEP 2 of 4: CREATING GNN-ENHANCED INDEXED CORPUS ---"
-echo "Using GNN checkpoint: $GNN_CHECKPOINT_PATH"
-echo "Output will be saved to: $GNN_INDEX_PATH"
-echo "--------------------------------------------------------"
-
-python retrieval/index.py \
-    --ckpt_path $BASE_RETRIEVER \
-    --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
-    --corpus-path "$CORPUS_PATH" \
-    --output-path "$GNN_INDEX_PATH"
-
-echo "Indexing complete."
-
-
 # --- 5. Run Dynamic Prediction ---
 echo
-echo "--- STEP 3 of 4: RUNNING DYNAMIC PREDICTION ---"
+echo "--- STEP 2 of 3: RUNNING DYNAMIC PREDICTION ---"
 echo "Using data from: $DATA_PATH"
 echo "Predictions will be saved to: $PREDICTIONS_PATH"
 echo "-----------------------------------------------"
@@ -133,7 +117,6 @@ echo "-----------------------------------------------"
 python retrieval/predict_dynamic.py \
     --retriever_ckpt_path $BASE_RETRIEVER \
     --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
-    --indexed_corpus_path "$GNN_INDEX_PATH" \
     --data_path "$DATA_PATH" \
     --output_path "$PREDICTIONS_PATH"
 
@@ -142,7 +125,7 @@ echo "Prediction complete."
 
 # --- 6. Evaluate Predictions ---
 echo
-echo "--- STEP 4 of 4: EVALUATING PREDICTIONS ---"
+echo "--- STEP 3 of 3: EVALUATING PREDICTIONS ---"
 echo "Evaluating predictions file: $PREDICTIONS_PATH"
 echo "-------------------------------------------"
 
