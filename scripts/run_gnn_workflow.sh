@@ -67,7 +67,6 @@ GNN_CONFIG="retrieval/confs/cli_gnn.yaml"
 BASE_RETRIEVER="kaiyuy/leandojo-lean4-retriever-byt5-small"
 
 # Define paths for artifacts that will be generated
-GNN_INDEX_PATH="${LOG_DIR}/indexed_corpus_gnn.pickle"
 PREDICTIONS_PATH="${LOG_DIR}/predictions_dynamic.pickle"
 
 
@@ -113,10 +112,10 @@ echo "Using data from: $DATA_PATH"
 echo "Predictions will be saved to: $PREDICTIONS_PATH"
 echo "-----------------------------------------------"
 
-# CORRECTED THE ARGUMENT NAME FROM --retri_ckpt_path to --retriever_ckpt_path
 python retrieval/predict_dynamic.py \
     --retriever_ckpt_path $BASE_RETRIEVER \
     --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
+    --corpus_path "$CORPUS_PATH" \
     --data_path "$DATA_PATH" \
     --output_path "$PREDICTIONS_PATH"
 

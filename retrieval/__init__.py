@@ -2,6 +2,6 @@
 
 Expose a small public surface used by tests.
 """
-from .gnn_utils import compute_ghost_node_embeddings
+from .gnn_utils import compute_ghost_node_embeddings_gcn
 
 __all__ = ["compute_ghost_node_embeddings"]

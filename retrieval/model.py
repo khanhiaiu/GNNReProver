@@ -38,6 +38,10 @@ torch.set_float32_matmul_precision("medium")
 
 
 class PremiseRetriever(pl.LightningModule):
+    # Add a class-level counter for logging
+    _predict_log_counter = 0
+    _max_predict_logs = 5
+
     def __init__(
         self,
         model_name: str,
@@ -79,7 +83,7 @@ class PremiseRetriever(pl.LightningModule):
         else:
             return model
 
-    def load_corpus(self, path_or_corpus: Union[str, Corpus]) -> None:
+    def load_corpus(self, path_or_corpus: Union[str, Corpus], graph_config: Optional[Dict[str, Any]] = None) -> None:
         """Associate the retriever with a corpus."""
         if isinstance(path_or_corpus, Corpus):
             self.corpus = path_or_corpus
@@ -89,7 +93,15 @@ class PremiseRetriever(pl.LightningModule):
 
         path = path_or_corpus
         if path.endswith(".jsonl"):  # A raw corpus without embeddings.
-            self.corpus = Corpus(path)
+            if graph_config is None:
+                # Provide a default config if none is given, to avoid crashing simple scripts.
+                logger.warning("graph_config not provided to load_corpus. Using a default configuration.")
+                graph_config = {
+                    'mode': 'custom',
+                    'use_proof_dependencies': True,
+                    'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
+                }
+            self.corpus = Corpus(path, graph_config)
             self.corpus_embeddings = None
             self.embeddings_staled = True
         else:  # A corpus with pre-computed embeddings.
@@ -290,6 +302,9 @@ class PremiseRetriever(pl.LightningModule):
     ##############
 
     def on_predict_start(self) -> None:
+        # Reset the counter at the beginning of prediction
+        PremiseRetriever._predict_log_counter = 0
+        
         # 1. Get initial embeddings from the base retriever (ByT5).
         # We always re-index to ensure the correct base embeddings are used.
         logger.info("Re-indexing corpus with base retriever before GNN refinement.")
@@ -303,16 +318,23 @@ class PremiseRetriever(pl.LightningModule):
         # 2. If a GNN is present, refine premise embeddings and cache each layer's output.
         if self.gnn_model is not None:
             logger.info("GNN model found. Caching premise embeddings for each GNN layer...")
+            
+            # Ensure the GNN is on the correct device and get its expected dtype
             device = self.corpus_embeddings.device
             self.gnn_model.to(device)
+            gnn_dtype = next(self.gnn_model.parameters()).dtype
 
+            # Explicitly cast the initial embeddings to match the GNN's dtype
+            initial_premise_embeddings = self.corpus_embeddings.to(gnn_dtype)
+            logger.info(f"Casting initial premise embeddings from {self.corpus_embeddings.dtype} to {gnn_dtype} to match GNN.")
+            
             edge_index = self.corpus.premise_dep_graph.edge_index.to(device)
             edge_attr = getattr(self.corpus.premise_dep_graph, "edge_attr", None)
             if edge_attr is not None:
                 edge_attr = edge_attr.to(device)
 
             self.premise_layer_embeddings = self.gnn_model.compute_premise_layer_embeddings(
-                self.corpus_embeddings, edge_index, edge_attr
+                initial_premise_embeddings, edge_index, edge_attr # Use the casted tensor
             )
             final_premise_embs = self.premise_layer_embeddings[-1]
 
@@ -320,6 +342,8 @@ class PremiseRetriever(pl.LightningModule):
             if self.gnn_model.hparams.concat_with_original_embeddings:
                 original_embs_norm = F.normalize(self.corpus_embeddings, p=2, dim=1)
                 final_gnn_embs_norm = F.normalize(final_premise_embs, p=2, dim=1)
+                # Ensure dtypes and devices match for concat
+                original_embs_norm = original_embs_norm.to(final_gnn_embs_norm.device, final_gnn_embs_norm.dtype)
                 concatenated_embs = torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1)
                 self.corpus_embeddings = F.normalize(concatenated_embs, p=2, dim=1)
             else:
@@ -334,6 +358,43 @@ class PremiseRetriever(pl.LightningModule):
             # EFFICIENT DYNAMIC GNN-AWARE RETRIEVAL
             initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
 
+            # --- START OF NEW LOGGING CODE ---
+            if PremiseRetriever._predict_log_counter < PremiseRetriever._max_predict_logs:
+                logger.info("\n" + "="*80)
+                logger.info(f"--- PREDICTION SAMPLE LOG #{PremiseRetriever._predict_log_counter + 1} ---")
+                
+                # Log the proof state
+                context_text = batch["context"][0].serialize()
+                logger.info(f"Proof State:\n{context_text}")
+                
+                # Log Local Context (lctx) Premises
+                lctx_premise_names = batch["lctx_premises"][0]
+                if lctx_premise_names:
+                    logger.info("  Local Context (lctx) Premises:")
+                    for name in lctx_premise_names:
+                        logger.info(f"    - {name}")
+                else:
+                    logger.info("  Local Context (lctx) Premises: [None]")
+
+                # Log Goal Premises
+                goal_premise_names = batch["goal_premises"][0]
+                if goal_premise_names:
+                    logger.info("  Goal Premises:")
+                    for name in goal_premise_names:
+                        logger.info(f"    - {name}")
+                else:
+                    logger.info("  Goal Premises: [None]")
+                
+                logger.info("="*80 + "\n")
+                PremiseRetriever._predict_log_counter += 1
+            # --- END OF NEW LOGGING CODE ---
+            
+            # --- START OF FIX ---
+            # Explicitly cast the initial context embeddings to match the GNN's dtype.
+            gnn_dtype = next(self.gnn_model.parameters()).dtype
+            initial_context_emb_casted = initial_context_emb.to(gnn_dtype)
+            # --- END OF FIX ---
+
             batch_lctx_neighbor_indices = [
                 torch.tensor([self.corpus.name2idx[n] for n in names if n in self.corpus.name2idx], dtype=torch.long)
                 for names in batch["lctx_premises"]
@@ -344,7 +405,7 @@ class PremiseRetriever(pl.LightningModule):
             ]
 
             context_emb = self.gnn_model.get_dynamic_context_embedding(
-                initial_context_embs=initial_context_emb,
+                initial_context_embs=initial_context_emb_casted, # Use the casted tensor
                 batch_lctx_neighbor_indices=batch_lctx_neighbor_indices,
                 batch_goal_neighbor_indices=batch_goal_neighbor_indices,
                 premise_layer_embeddings=self.premise_layer_embeddings,

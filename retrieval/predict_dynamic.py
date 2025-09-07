@@ -17,7 +17,7 @@ import argparse
 from loguru import logger
 import pytorch_lightning as pl
 
-from common import IndexedCorpus
+from common import Corpus
 from retrieval.model import PremiseRetriever
 from retrieval.gnn_model import GNNRetriever
 from retrieval.datamodule import RetrievalDataModule
@@ -27,7 +27,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Script for dynamic GNN-based or static retrieval.")
     parser.add_argument("--retriever_ckpt_path", type=str, required=True, help="Path to the ByT5 retriever checkpoint.")
     parser.add_argument("--gnn_ckpt_path", type=str, default=None, help="Optional path to the GNN checkpoint. If not provided, performs static retrieval.")
-    parser.add_argument("--indexed_corpus_path", type=str, required=True, help="Path to the indexed corpus.")
+    parser.add_argument("--corpus_path", type=str, required=True, help="Path to the raw corpus.jsonl file.")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the data (e.g., data/leandojo_benchmark_4/random).")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the prediction pickle file.")
     parser.add_argument("--batch_size", type=int, default=64)
@@ -37,15 +37,27 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    retriever = PremiseRetriever.load_hf(args.retriever_ckpt_path, 2048, device)
-    
+    # --- Step 1: Load the trained GNN model FIRST to get its config ---
     logger.info(f"Loading GNN from {args.gnn_ckpt_path} for dynamic retrieval.")
     gnn_model = GNNRetriever.load(args.gnn_ckpt_path, device, freeze=True)
+
+    # --- Step 2: Extract the true graph_config from the loaded model ---
+    graph_config_from_checkpoint = gnn_model.hparams.graph_dependencies
+    logger.info(f"Using graph_config from trained GNN checkpoint: {graph_config_from_checkpoint}")
+
+    # --- Step 3: Load the base retriever and the corpus using the correct config ---
+    retriever = PremiseRetriever.load_hf(args.retriever_ckpt_path, 2048, device)
+    
+    logger.info(f"Loading corpus from {args.corpus_path}")
+    retriever.load_corpus(args.corpus_path, graph_config=graph_config_from_checkpoint)
+
+    # --- Step 4: Attach the GNN to the retriever ---
     retriever.gnn_model = gnn_model
 
+    # --- Step 5: Setup the datamodule ---
     datamodule = RetrievalDataModule(
         data_path=args.data_path,
-        corpus_path=None, # Not needed, corpus is in retriever
+        corpus_path=None, # Not needed, corpus is already in retriever
         model_name=args.retriever_ckpt_path, # For tokenizer
         batch_size=args.batch_size,
         eval_batch_size=args.batch_size,
