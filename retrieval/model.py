@@ -57,6 +57,7 @@ class PremiseRetriever(pl.LightningModule):
         self.embeddings_staled = True
 
         self.gnn_model: Optional[GNNRetriever] = None
+        self.premise_layer_embeddings: Optional[List[torch.FloatTensor]] = None
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "PremiseRetriever":
@@ -289,65 +290,69 @@ class PremiseRetriever(pl.LightningModule):
     ##############
 
     def on_predict_start(self) -> None:
-        if self.corpus_embeddings is not None:
-            logger.info("Corpus embeddings are already loaded. Skipping re-indexing.")
-            self.embeddings_staled = False
-        else:
-            self.corpus = self.trainer.datamodule.corpus
-            self.corpus_embeddings = None
-            self.embeddings_staled = True
-            self.reindex_corpus(self.trainer.datamodule.eval_batch_size)
+        # 1. Get initial embeddings from the base retriever (ByT5).
+        # We always re-index to ensure the correct base embeddings are used.
+        logger.info("Re-indexing corpus with base retriever before GNN refinement.")
+        self.corpus = self.trainer.datamodule.corpus
+        self.corpus_embeddings = None
+        self.embeddings_staled = True
+        self.reindex_corpus(self.trainer.datamodule.eval_batch_size)
+
+        self.premise_layer_embeddings = []
+
+        # 2. If a GNN is present, refine premise embeddings and cache each layer's output.
+        if self.gnn_model is not None:
+            logger.info("GNN model found. Caching premise embeddings for each GNN layer...")
+            device = self.corpus_embeddings.device
+            self.gnn_model.to(device)
+
+            edge_index = self.corpus.premise_dep_graph.edge_index.to(device)
+            edge_attr = getattr(self.corpus.premise_dep_graph, "edge_attr", None)
+            if edge_attr is not None:
+                edge_attr = edge_attr.to(device)
+
+            self.premise_layer_embeddings = self.gnn_model.compute_premise_layer_embeddings(
+                self.corpus_embeddings, edge_index, edge_attr
+            )
+            final_premise_embs = self.premise_layer_embeddings[-1]
+
+            # Overwrite self.corpus_embeddings with the final GNN-refined embeddings for KNN search.
+            if self.gnn_model.hparams.concat_with_original_embeddings:
+                original_embs_norm = F.normalize(self.corpus_embeddings, p=2, dim=1)
+                final_gnn_embs_norm = F.normalize(final_premise_embs, p=2, dim=1)
+                concatenated_embs = torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1)
+                self.corpus_embeddings = F.normalize(concatenated_embs, p=2, dim=1)
+            else:
+                self.corpus_embeddings = F.normalize(final_premise_embs, p=2, dim=1)
+            
+            logger.info(f"Cached {len(self.premise_layer_embeddings)} sets of premise embeddings.")
 
         self.predict_step_outputs = []
 
     def predict_step(self, batch: Dict[str, Any], _):
         if self.gnn_model is not None:
-            # DYNAMIC GNN-AWARE RETRIEVAL
-            # 1. Get initial context embedding from the text encoder.
+            # EFFICIENT DYNAMIC GNN-AWARE RETRIEVAL
             initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
 
-            # 2. Prepare neighbor indices from `lctx_premises` and `goal_premises`.
-            batch_lctx_neighbor_indices = []
-            for lctx_premises_list in batch["lctx_premises"]:
-                indices = [
-                    self.corpus.name2idx[name]
-                    for name in lctx_premises_list
-                    if name in self.corpus.name2idx
-                ]
-                batch_lctx_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
-            
-            batch_goal_neighbor_indices = []
-            for goal_premises_list in batch["goal_premises"]:
-                indices = [
-                    self.corpus.name2idx[name]
-                    for name in goal_premises_list
-                    if name in self.corpus.name2idx
-                ]
-                batch_goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
+            batch_lctx_neighbor_indices = [
+                torch.tensor([self.corpus.name2idx[n] for n in names if n in self.corpus.name2idx], dtype=torch.long)
+                for names in batch["lctx_premises"]
+            ]
+            batch_goal_neighbor_indices = [
+                torch.tensor([self.corpus.name2idx[n] for n in names if n in self.corpus.name2idx], dtype=torch.long)
+                for names in batch["goal_premises"]
+            ]
 
-            # 3. Get the initial (layer 0) premise embeddings from the indexed corpus.
-            #    NOTE: For this to work, the indexed_corpus must store initial embeddings.
-            initial_node_features = self.corpus_embeddings
-            device = initial_context_emb.device
-            edge_index = self.corpus.premise_dep_graph.edge_index.to(device)
-            edge_attr = getattr(self.corpus.premise_dep_graph, 'edge_attr', None)
-            if edge_attr is not None:
-                edge_attr = edge_attr.to(device)
-
-            logger.info(f"Getting dynamic context embedding with GNN on device {device}")
-
-            # 4. Get the dynamic context embedding using the GNN's symmetric pass.
-            context_emb, final_premise_embs = self.gnn_model.get_dynamic_context_embedding(
+            context_emb = self.gnn_model.get_dynamic_context_embedding(
                 initial_context_embs=initial_context_emb,
                 batch_lctx_neighbor_indices=batch_lctx_neighbor_indices,
                 batch_goal_neighbor_indices=batch_goal_neighbor_indices,
-                initial_node_features=initial_node_features,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
+                premise_layer_embeddings=self.premise_layer_embeddings,
             )
             
+            # Retrieve against the pre-computed final premise embeddings.
             retrieved_premises, scores = self.corpus.get_nearest_premises(
-                final_premise_embs,
+                self.corpus_embeddings,
                 batch["context"],
                 context_emb,
                 self.num_retrieved,
@@ -411,7 +416,6 @@ class PremiseRetriever(pl.LightningModule):
             items_in_batch += 1 # 
             self.predict_step_outputs.append(prediction_item) # Keep this for backward compatibility
             batch_outputs.append(prediction_item)  
-
 
         logger.info(
             f"Worker PID: {os.getpid()} "

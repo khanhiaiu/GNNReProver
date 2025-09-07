@@ -5,7 +5,7 @@ from torch import Tensor
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import add_remaining_self_loops, scatter
 
-def compute_ghost_node_embeddings(
+def compute_ghost_node_embeddings_gcn(
     gcn_layer: GCNConv,
     existing_node_embs: Tensor,
     original_edge_index: Tensor,
