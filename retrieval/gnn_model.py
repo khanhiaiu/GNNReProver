@@ -523,7 +523,7 @@ class GNNRetriever(pl.LightningModule):
         num_premises = initial_node_features.shape[0]
 
         # Create augmented graph with ghost nodes
-        augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph(
+        augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             initial_node_features, initial_context_embs, edge_index, edge_attr, batch_lctx_neighbor_indices, batch_goal_neighbor_indices
         )
 
@@ -599,7 +599,7 @@ class GNNRetriever(pl.LightningModule):
                 x_premise = self.norm_layers[i](x_premise)
             
             if self.use_residual and x_premise.shape == x_residual.shape:
-                 x_premise = x_premise + x_residual
+                x_premise = x_premise + x_residual
             
             if i < len(self.layers) - 1:
                 x_premise = F.relu(x_premise)
