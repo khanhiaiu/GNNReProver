@@ -327,9 +327,14 @@ class PremiseRetriever(pl.LightningModule):
 
             # 3. Get the initial (layer 0) premise embeddings from the indexed corpus.
             #    NOTE: For this to work, the indexed_corpus must store initial embeddings.
-            initial_node_features = self.corpus_embeddings 
-            edge_index = self.corpus.premise_dep_graph.edge_index
+            initial_node_features = self.corpus_embeddings
+            device = initial_context_emb.device
+            edge_index = self.corpus.premise_dep_graph.edge_index.to(device)
             edge_attr = getattr(self.corpus.premise_dep_graph, 'edge_attr', None)
+            if edge_attr is not None:
+                edge_attr = edge_attr.to(device)
+
+            logger.info(f"Getting dynamic context embedding with GNN on device {device}")
 
             # 4. Get the dynamic context embedding using the GNN's symmetric pass.
             context_emb, final_premise_embs = self.gnn_model.get_dynamic_context_embedding(
