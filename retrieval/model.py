@@ -202,7 +202,7 @@ class PremiseRetriever(pl.LightningModule):
         if not self.embeddings_staled:
             return
         logger.info("Re-indexing the retrieval corpus")
-        raise RuntimeError("Should not reindex when using gnn (this is a debug error to prevent reindexing)")
+        #raise RuntimeError("Should not reindex when using gnn (this is a debug error to prevent reindexing)")
 
         self.corpus_embeddings = torch.zeros(
             len(self.corpus.all_premises),

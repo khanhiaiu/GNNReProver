@@ -552,7 +552,7 @@ class GNNRetriever(pl.LightningModule):
         
         return final_context_embs, final_premise_embs
     
-        @torch.no_grad()
+    @torch.no_grad()
     def get_dynamic_context_embedding(
         self,
         initial_context_embs: torch.FloatTensor,
