@@ -47,6 +47,7 @@ class GNNRetriever(pl.LightningModule):
         use_residual: bool = True,
         dropout_p: float = 0.5,
         edge_dropout_p: float = 0.1,
+        lm_mask_p: float = 0.5,
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         concat_with_original_embeddings: bool = False,
@@ -67,6 +68,7 @@ class GNNRetriever(pl.LightningModule):
         self.use_residual = use_residual
         self.dropout_p = dropout_p
         self.edge_dropout_p = edge_dropout_p
+        self.lm_mask_p = lm_mask_p
         self.norm_type = norm_type.lower() if norm_type else "none"
         self.use_initial_projection = use_initial_projection
         self.edge_type_to_id = edge_type_to_id
@@ -341,8 +343,19 @@ class GNNRetriever(pl.LightningModule):
         gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
         if self.hparams.concat_with_original_embeddings:
+            # Normalize original embeddings
             original_premise_embs = F.normalize(node_features.to(gnn_premise_embs.device), p=2, dim=1)
             original_context_embs = F.normalize(context_features.to(gnn_context_embs.device), p=2, dim=1)
+
+            # Stochastic LM masking during training: replace original embeddings with zeros with probability lm_mask_p
+            if self.training and (self.lm_mask_p is not None) and (self.lm_mask_p > 0.0):
+                # Use device-aligned uniform random draw
+                rand_val = torch.rand(1, device=gnn_premise_embs.device).item()
+                if rand_val < float(self.lm_mask_p):
+                    original_premise_embs = torch.zeros_like(original_premise_embs)
+                    original_context_embs = torch.zeros_like(original_context_embs)
+
+            # Concatenate GNN outputs with (possibly masked) originals and normalize
             final_premise_embs = F.normalize(torch.cat([gnn_premise_embs, original_premise_embs], dim=1), p=2, dim=1)
             final_context_embs = F.normalize(torch.cat([gnn_context_embs, original_context_embs], dim=1), p=2, dim=1)
         else:
