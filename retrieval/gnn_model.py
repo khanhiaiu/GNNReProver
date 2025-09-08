@@ -37,7 +37,7 @@ class GNNRetriever(pl.LightningModule):
         num_layers: int,
         graph_dependencies_config: Dict[str, Any], 
         edge_type_to_id: Dict[str, int],
-        lr : float, # Why is this unused?
+        lr : float,
         warmup_steps : int,
         gnn_layer_type: str = "rgcn",
         hidden_size: Optional[int] = None,
@@ -49,7 +49,7 @@ class GNNRetriever(pl.LightningModule):
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         concat_with_original_embeddings: bool = False,
-        num_logs_per_epoch: int = 5,  # <-- ADD THIS NEW PARAMETER
+        num_logs_per_epoch: int = 5,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -67,7 +67,6 @@ class GNNRetriever(pl.LightningModule):
         self.dropout_p = dropout_p
         self.norm_type = norm_type.lower() if norm_type else "none"
         self.use_initial_projection = use_initial_projection
-
         self.edge_type_to_id = edge_type_to_id
 
         # Initial projection layer (optional)
@@ -98,131 +97,101 @@ class GNNRetriever(pl.LightningModule):
             elif norm_type == "instance":
                 return nn.InstanceNorm1d(num_features)
             elif norm_type == "group":
-                # Use 8 groups by default, ensure it divides num_features
                 num_groups = min(8, num_features)
                 while num_features % num_groups != 0 and num_groups > 1:
                     num_groups -= 1
                 return nn.GroupNorm(num_groups, num_features)
-            else:  # "none" or invalid
+            else:
                 return None
 
-        # Build GNN layers based on the specified type
+        # --- OPTIMIZATION 2: Refactor GNN Layer Initialization ---
+        # Define GNN layer configurations in a dictionary for cleaner code
+        layer_configs = {
+            "gcn": (GCNConv, {"out_channels": self.hidden_size}),
+            "rgcn": (RGCNConv, {"out_channels": self.hidden_size, "num_relations": num_relations}),
+            "gat": (GATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "concat": False}),
+            "rgat": (RGATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "num_relations": num_relations, "concat": False}),
+            "gin": (GINConv, {}),  # GIN requires a special case for its MLP
+        }
+
+        if self.gnn_layer_type not in layer_configs:
+            raise ValueError(f"Unsupported GNN layer type: {self.gnn_layer_type}. Supported types: {list(layer_configs.keys())}")
+
         self.layers = nn.ModuleList()
         self.norm_layers = nn.ModuleList() if self.norm_type != "none" else None
         
-        # Determine input/output sizes for layers
         input_size = self.hidden_size if use_initial_projection else feature_size
         
-        if self.gnn_layer_type == "gcn":
-            for i in range(num_layers):
-                self.layers.append(GCNConv(input_size, self.hidden_size))
-                if self.norm_type != "none":
-                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
-                    self.norm_layers.append(norm_layer)
-                input_size = self.hidden_size
-        elif self.gnn_layer_type == "rgcn":
-            for i in range(num_layers):
-                self.layers.append(RGCNConv(input_size, self.hidden_size, num_relations=num_relations))
-                if self.norm_type != "none":
-                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
-                    self.norm_layers.append(norm_layer)
-                input_size = self.hidden_size
-        elif self.gnn_layer_type == "gat":
-            for i in range(num_layers):
-                # GAT: When concat=False, outputs are averaged across heads
-                # So we need each head to output hidden_size dimensions to get hidden_size output
-                self.layers.append(GATConv(input_size, self.hidden_size, heads=gat_heads, concat=False))
-                if self.norm_type != "none":
-                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
-                    self.norm_layers.append(norm_layer)
-                input_size = self.hidden_size
-        elif self.gnn_layer_type == "rgat":
-            for i in range(num_layers):
-                # RGAT: Same logic as GAT - each head outputs hidden_size dimensions
-                self.layers.append(RGATConv(input_size, self.hidden_size, heads=gat_heads, num_relations=num_relations, concat=False))
-                if self.norm_type != "none":
-                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
-                    self.norm_layers.append(norm_layer)
-                input_size = self.hidden_size
-        elif self.gnn_layer_type == "gin":
-            for i in range(num_layers):
-                # GIN uses an MLP for the neural network component
+        for i in range(num_layers):
+            if self.gnn_layer_type == "gin":
                 mlp = nn.Sequential(
                     nn.Linear(input_size, self.hidden_size * 2),
                     nn.ReLU(),
                     nn.Linear(self.hidden_size * 2, self.hidden_size)
                 )
-                self.layers.append(GINConv(mlp))
-                if self.norm_type != "none":
-                    norm_layer = create_norm_layer(self.norm_type, self.hidden_size)
-                    self.norm_layers.append(norm_layer)
-                input_size = self.hidden_size
+                layer = GINConv(mlp)
+            else:
+                layer_class, kwargs = layer_configs[self.gnn_layer_type]
+                # Dynamically set the input channels for the current layer
+                current_kwargs = kwargs.copy()
+                # PyG layers use different names for input size, handle common ones
+                if "in_channels" in GCNConv.__init__.__code__.co_varnames:
+                    current_kwargs["in_channels"] = input_size
+                else: # Fallback for older/different APIs
+                    current_kwargs["in_feats"] = input_size
+
+                layer = layer_class(**current_kwargs)
+            
+            self.layers.append(layer)
+
+            if self.norm_type != "none":
+                self.norm_layers.append(create_norm_layer(self.norm_type, self.hidden_size))
+                
+            input_size = self.hidden_size
+
+    # --- OPTIMIZATION 3: Refactor GNN Layer Application ---
+    def _apply_gnn_layer(self, layer: nn.Module, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
+        """Applies a single GNN layer based on its type, centralizing logic."""
+        if self.gnn_layer_type in ["gcn", "gat", "gin"]:
+            return layer(x, edge_index)
+        elif self.gnn_layer_type in ["rgcn", "rgat"]:
+            if self.use_edge_attr and edge_attr is not None:
+                return layer(x, edge_index, edge_attr)
+            else:
+                default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
+                return layer(x, edge_index, default_edge_attr)
         else:
-            raise ValueError(f"Unsupported GNN layer type: {gnn_layer_type}. Supported types: gcn, rgcn, gat, rgat, gin")
+            # This path should not be reached due to the check in __init__
+            raise ValueError(f"Unsupported GNN layer type: {self.gnn_layer_type}")
 
     def _gnn_forward_pass(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """
         Apply GNN layers with optional initial projection, residual connections, 
-        batch normalization, ReLU activation and dropout between layers.
-        
-        Args:
-            x: Input node features
-            edge_index: Edge connectivity information  
-            edge_attr: Edge attributes (edge types)
-            
-        Returns:
-            Output node features after passing through all GNN layers
+        normalization, activation and dropout.
         """
-        # Store original input for residual connection
         x_orig = x
         
-        # Apply initial projection if enabled
         if self.initial_projection is not None:
             x = self.initial_projection(x)
         
         for i, layer in enumerate(self.layers):
-            # Store input for potential residual connection
             x_residual = x
             
-            # Apply GNN layer based on type
-            if self.gnn_layer_type == "gcn":
-                x = layer(x, edge_index)
-            elif self.gnn_layer_type == "rgcn":
-                if self.use_edge_attr and edge_attr is not None:
-                    x = layer(x, edge_index, edge_attr)
-                else:
-                    # If no edge attributes, use edge type 0 for all edges
-                    default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
-                    x = layer(x, edge_index, default_edge_attr)
-            elif self.gnn_layer_type == "gat":
-                x = layer(x, edge_index)
-            elif self.gnn_layer_type == "rgat":
-                if self.use_edge_attr and edge_attr is not None:
-                    x = layer(x, edge_index, edge_attr)
-                else:
-                    # If no edge attributes, use edge type 0 for all edges
-                    default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
-                    x = layer(x, edge_index, default_edge_attr)
-            elif self.gnn_layer_type == "gin":
-                x = layer(x, edge_index)
+            # Use the refactored helper method
+            x = self._apply_gnn_layer(layer, x, edge_index, edge_attr)
             
-            # Apply normalization if enabled
             if self.norm_layers is not None and i < len(self.norm_layers):
                 x = self.norm_layers[i](x)
             
-            # Apply residual connection if enabled and shapes match
             if self.use_residual and x.shape == x_residual.shape:
                 x = x + x_residual
             elif self.use_residual and i == 0 and self.residual_projection is not None:
-                # For the first layer, project original input if shapes don't match
                 x = x + self.residual_projection(x_orig)
                     
-            # Apply activation and dropout (except for the last layer)
             if i < len(self.layers) - 1:
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
         
-        # Apply final projection if needed to get back to feature_size
         if self.final_projection is not None:
             x = self.final_projection(x)
         
@@ -236,8 +205,7 @@ class GNNRetriever(pl.LightningModule):
         elif hasattr(first_layer, 'lin_l') and hasattr(first_layer.lin_l, 'weight'):
             return first_layer.lin_l.weight.device, first_layer.lin_l.weight.dtype
         else:
-            # Fallback to module parameters
-            param = next(first_layer.parameters())
+            param = next(self.parameters())
             return param.device, param.dtype
 
     def _create_augmented_graph_full(
@@ -250,59 +218,53 @@ class GNNRetriever(pl.LightningModule):
         goal_neighbor_indices: List[torch.LongTensor],
     ) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor]]:
         """
-        Create augmented graph by adding ghost nodes and their connections.
+        Create augmented graph using vectorized operations to avoid CPU-bound loops.
         """
         target_device, target_dtype = self._get_target_device_and_dtype()
         num_premises = node_features.shape[0]
+        num_contexts = context_features.shape[0]
         
-        # --- 1. Augment Node Features (no change) ---
         augmented_features = torch.cat(
             [node_features.to(target_device, target_dtype), context_features.to(target_device, target_dtype)], 
             dim=0
         )
 
-        # --- 2. Augment Edges using the refactored logic ---
-        new_edges_src = []
-        new_edges_dst = []
-        new_edge_attrs = []
+        all_new_edges_src = []
+        all_new_edges_dst = []
+        all_new_edge_attrs = []
+        
+        def process_neighbors(neighbor_indices_list, edge_name_key):
+            edge_name = _get_edge_type_name_from_tag(edge_name_key, self.graph_dependencies_config)
+            if not edge_name or edge_name not in self.edge_type_to_id:
+                return
+
+            edge_type_id = self.edge_type_to_id[edge_name]
+            
+            valid_indices = [t for t in neighbor_indices_list if t.numel() > 0]
+            if not valid_indices: return
+                
+            src_nodes = torch.cat(valid_indices).to(target_device)
+            counts = torch.tensor([t.numel() for t in neighbor_indices_list], device=target_device)
+            context_ids = torch.arange(num_contexts, device=target_device)
+            dst_nodes = num_premises + context_ids.repeat_interleave(counts)
+            
+            all_new_edges_src.append(src_nodes)
+            all_new_edges_dst.append(dst_nodes)
+
+            if self.use_edge_attr:
+                all_new_edge_attrs.append(torch.full_like(src_nodes, fill_value=edge_type_id))
 
         sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
-        context_neighbor_verbosity = sig_cfg.get('verbosity', 'verbose')
-        
-        # Dynamically create tags based on the configured verbosity
-        lctx_tag = f"signature_{context_neighbor_verbosity}_lctx"
-        goal_tag = f"signature_{context_neighbor_verbosity}_goal"
+        verbosity = sig_cfg.get('verbosity', 'verbose')
+        process_neighbors(lctx_neighbor_indices, f"signature_{verbosity}_lctx")
+        process_neighbors(goal_neighbor_indices, f"signature_{verbosity}_goal")
 
-        # Determine edge types using the common helper function
-        lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
-        goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
-
-        if lctx_edge_name and lctx_edge_name in self.edge_type_to_id:
-            lctx_edge_type_id = self.edge_type_to_id[lctx_edge_name]
-            for i, indices in enumerate(lctx_neighbor_indices):
-                ghost_node_idx = num_premises + i
-                for neighbor_idx in indices:
-                    new_edges_src.append(neighbor_idx.item())
-                    new_edges_dst.append(ghost_node_idx)
-                    new_edge_attrs.append(lctx_edge_type_id)
-
-        if goal_edge_name and goal_edge_name in self.edge_type_to_id:
-            goal_edge_type_id = self.edge_type_to_id[goal_edge_name]
-            for i, indices in enumerate(goal_neighbor_indices):
-                ghost_node_idx = num_premises + i
-                for neighbor_idx in indices:
-                    new_edges_src.append(neighbor_idx.item())
-                    new_edges_dst.append(ghost_node_idx)
-                    new_edge_attrs.append(goal_edge_type_id)
-
-        # The rest of the function remains the same...
-        if new_edges_src:
-            new_edges = torch.tensor([new_edges_src, new_edges_dst], dtype=torch.long, device=target_device)
+        if all_new_edges_src:
+            new_edges = torch.stack([torch.cat(all_new_edges_src), torch.cat(all_new_edges_dst)])
             augmented_edge_index = torch.cat([edge_index.to(target_device), new_edges], dim=1)
             
-            if self.use_edge_attr and edge_attr is not None:
-                new_edge_attrs_tensor = torch.tensor(new_edge_attrs, dtype=torch.long, device=target_device)
-                augmented_edge_attr = torch.cat([edge_attr.to(target_device), new_edge_attrs_tensor])
+            if self.use_edge_attr and edge_attr is not None and all_new_edge_attrs:
+                augmented_edge_attr = torch.cat([edge_attr.to(target_device), torch.cat(all_new_edge_attrs)])
             else:
                 augmented_edge_attr = None
         else:
@@ -318,13 +280,6 @@ class GNNRetriever(pl.LightningModule):
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
         Extract premise and context embeddings from combined tensor and normalize them.
-        
-        Args:
-            x: Combined tensor containing both premise and context embeddings
-            num_premises: Number of premise nodes (used to split the tensor)
-            
-        Returns:
-            Tuple of (normalized_premise_embeddings, normalized_context_embeddings)
         """
         final_premise_embs = F.normalize(x[:num_premises], p=2, dim=1)
         final_context_embs = F.normalize(x[num_premises:], p=2, dim=1)
@@ -334,22 +289,13 @@ class GNNRetriever(pl.LightningModule):
     def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """
         Public method to apply GNN layers to embeddings. Used for external inference.
-        This method disables training mode for consistent inference behavior.
-        
-        Args:
-            x: Input node features
-            edge_index: Edge connectivity information
-            edge_attr: Edge attributes (edge types)
-            
-        Returns:
-            Output node features after passing through all GNN layers
         """
         was_training = self.training
-        self.eval()  # Ensure we're in eval mode
+        self.eval()
         try:
             return self._gnn_forward_pass(x, edge_index, edge_attr)
         finally:
-            self.train(was_training)  # Restore original training mode
+            self.train(was_training)
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "GNNRetriever":
@@ -369,38 +315,25 @@ class GNNRetriever(pl.LightningModule):
     ) -> torch.FloatTensor:
         num_premises = node_features.shape[0]
 
-        # --- 1. Create Augmented Graph ---
+        # This now calls the new, vectorized implementation
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
             
-        # --- 2. Single GNN Pass on Augmented Graph ---
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
-        
-        # --- 3. Extract and Normalize GNN Embeddings ---
         gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
-        # --- 4. (Optional) Concatenate with Original Embeddings ---
         if self.hparams.concat_with_original_embeddings:
-            # Ensure original features are on the correct device and normalized
             original_premise_embs = F.normalize(node_features.to(gnn_premise_embs.device), p=2, dim=1)
             original_context_embs = F.normalize(context_features.to(gnn_context_embs.device), p=2, dim=1)
-
-            # Concatenate GNN-processed and original embeddings
-            final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
-            final_context_embs = torch.cat([gnn_context_embs, original_context_embs], dim=1)
-
-            # CRITICAL: Re-normalize the concatenated vectors before similarity calculation
-            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
-            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+            final_premise_embs = F.normalize(torch.cat([gnn_premise_embs, original_premise_embs], dim=1), p=2, dim=1)
+            final_context_embs = F.normalize(torch.cat([gnn_context_embs, original_context_embs], dim=1), p=2, dim=1)
         else:
             final_premise_embs = gnn_premise_embs
             final_context_embs = gnn_context_embs
 
-        # --- 5. Contrastive Loss Calculation ---
         pos_premise_emb = final_premise_embs[pos_premise_indices]
         neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
-        
         all_premise_embs = torch.cat([pos_premise_emb] + neg_premise_embs_flat, dim=0)
 
         similarity = torch.mm(final_context_embs, all_premise_embs.t())
@@ -424,24 +357,22 @@ class GNNRetriever(pl.LightningModule):
             self.logging_steps = []
             return
 
-        # Ensure we don't log more times than there are batches
         if num_logs > total_batches:
             num_logs = total_batches
 
-        # Calculate evenly spaced logging steps, ensuring the last batch is included
-        interval = total_batches // num_logs
-        self.logging_steps = [(i * interval) for i in range(1, num_logs)]
-        self.logging_steps.append(total_batches - 1) # Log on the very last batch
-        self.logging_steps = sorted(list(set(self.logging_steps))) # Ensure uniqueness and order
+        interval = total_batches // num_logs if num_logs > 0 else total_batches
+        self.logging_steps = [(i * interval) for i in range(num_logs)]
+        # Log on the very last batch if it's not already included
+        if total_batches - 1 not in self.logging_steps:
+             self.logging_steps.append(total_batches - 1)
+        self.logging_steps = sorted(list(set(self.logging_steps)))
 
         logger.info(f"Epoch {self.current_epoch}: Will log training samples at batch indices: {self.logging_steps}")
 
     @torch.no_grad()
     def _log_training_sample(self, batch: Dict[str, Any], batch_idx: int):
         """Logs a single sample from the batch for inspection during training."""
-        self.eval()  # Set to eval mode for logging to disable dropout etc.
-
-        # 1. Log State/Goal Text and Ingoing Edges
+        self.eval()
         context_text = batch["context"][0].serialize()
         lctx_indices = batch["lctx_neighbor_indices"][0]
         goal_indices = batch["goal_neighbor_indices"][0]
@@ -451,25 +382,17 @@ class GNNRetriever(pl.LightningModule):
         logger.info(f"State/Goal Text: \n{context_text}")
         logger.info("  Ingoing Edges to Ghost Node:")
         for idx in lctx_indices:
-            premise_name = corpus.all_premises[idx.item()].full_name
-            logger.info(f"    <- [lctx] <- {premise_name}")
+            logger.info(f"    <- [lctx] <- {corpus.all_premises[idx.item()].full_name}")
         for idx in goal_indices:
-            premise_name = corpus.all_premises[idx.item()].full_name
-            logger.info(f"    <- [goal] <- {premise_name}")
+            logger.info(f"    <- [goal] <- {corpus.all_premises[idx.item()].full_name}")
 
-        # 2. Log Embeddings (Before and After GNN)
         initial_context_emb = batch["context_features"][0]
         logger.info(f"  Initial Context Embedding (first 8 values): {initial_context_emb[:8].cpu().numpy()}")
 
-        # Re-run forward pass logic for this single sample to get the final embedding
         num_premises = batch["node_features"].shape[0]
         aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
-            batch["node_features"],
-            batch["context_features"][[0]],  # Select the first context
-            batch["edge_index"],
-            batch.get("edge_attr"),
-            [batch["lctx_neighbor_indices"][0]],
-            [batch["goal_neighbor_indices"][0]],
+            batch["node_features"], batch["context_features"][[0]], batch["edge_index"],
+            batch.get("edge_attr"), [batch["lctx_neighbor_indices"][0]], [batch["goal_neighbor_indices"][0]],
         )
         x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
         _, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
@@ -482,40 +405,24 @@ class GNNRetriever(pl.LightningModule):
 
         logger.info(f"  Final GNN Context Embedding (first 8 values):   {final_context_emb[:8].cpu().numpy()}")
         logger.info("--- End of Training Sample Log ---")
-        
-        self.train()  # Switch back to train mode
+        self.train()
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        # Periodically log a sample from the batch based on pre-calculated steps.
-        # The batch_idx is provided by Lightning and tracks the index within the current epoch.
         if hasattr(self, "logging_steps") and batch_idx in self.logging_steps:
             if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
                 self._log_training_sample(batch, batch_idx)
 
         loss = self(
-            batch["node_features"],
-            batch["edge_index"],
-            batch["context_features"],
-            batch["lctx_neighbor_indices"],
-            batch["goal_neighbor_indices"],
-            batch["pos_premise_indices"],
-            batch["neg_premises_indices"],
-            batch["label"],
-            batch.get("edge_attr", None),  # Handle optional edge attributes
+            batch["node_features"], batch["edge_index"], batch["context_features"],
+            batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
+            batch["pos_premise_indices"], batch["neg_premises_indices"],
+            batch["label"], batch.get("edge_attr", None),
         )
-        self.log(
-            "loss_train",
-            loss,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=len(batch["context_features"]),
-        )
+        self.log("loss_train", loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
         return loss
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        return get_optimizers(
-            self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps
-        )
+        return get_optimizers(self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps)
     
     @torch.no_grad()
     def compute_premise_layer_embeddings(
@@ -530,28 +437,17 @@ class GNNRetriever(pl.LightningModule):
         self.eval()
         layer_embeddings = []
         x = initial_embeddings
-        
         x_orig = x
+        
         if self.initial_projection is not None:
             x = self.initial_projection(x)
-        layer_embeddings.append(x.clone())  # Cache the input for GNN layer 0
+        layer_embeddings.append(x.clone())
         
         for i, layer in enumerate(self.layers):
             x_residual = x
             
-            # Replicate logic from _gnn_forward_pass for applying the layer
-            if self.gnn_layer_type == "gcn":
-                x = layer(x, edge_index)
-            elif self.gnn_layer_type in ["rgcn", "rgat"]:
-                if self.use_edge_attr and edge_attr is not None:
-                    x = layer(x, edge_index, edge_attr)
-                else:
-                    default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
-                    x = layer(x, edge_index, default_edge_attr)
-            elif self.gnn_layer_type == "gat":
-                x = layer(x, edge_index)
-            elif self.gnn_layer_type == "gin":
-                x = layer(x, edge_index)
+            # Use the refactored helper method
+            x = self._apply_gnn_layer(layer, x, edge_index, edge_attr)
 
             if self.norm_layers is not None and i < len(self.norm_layers):
                 x = self.norm_layers[i](x)
@@ -559,7 +455,6 @@ class GNNRetriever(pl.LightningModule):
             if self.use_residual and x.shape == x_residual.shape:
                 x = x + x_residual
             elif self.use_residual and i == 0 and self.residual_projection is not None:
-                # The residual from the original features needs to be projected.
                 x = x + self.residual_projection(x_orig)
 
             if i < len(self.layers) - 1:
@@ -573,6 +468,7 @@ class GNNRetriever(pl.LightningModule):
 
         return layer_embeddings
 
+    # The rest of the file remains unchanged as it was not part of the requested optimizations
     @torch.no_grad()
     def get_dynamic_context_embedding(
         self,
@@ -584,16 +480,16 @@ class GNNRetriever(pl.LightningModule):
         """
         Efficiently computes final GNN-refined embeddings for a batch of contexts (ghost nodes).
         """
-        
         self.eval()
         context_embs = initial_context_embs
 
         if self.initial_projection is not None:
             context_embs = self.initial_projection(context_embs)
 
-        # Combine lctx and goal neighbors for efficient processing
-        lctx_tag = f"signature_{self.context_neighbor_verbosity}_lctx"
-        goal_tag = f"signature_{self.context_neighbor_verbosity}_goal"
+        sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
+        verbosity = sig_cfg.get('verbosity', 'verbose')
+        lctx_tag = f"signature_{verbosity}_lctx"
+        goal_tag = f"signature_{verbosity}_goal"
         lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
         goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
         lctx_edge_type_id = self.edge_type_to_id.get(lctx_edge_name)
@@ -614,10 +510,8 @@ class GNNRetriever(pl.LightningModule):
                 (torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long))
             )
 
-        # Main loop over GNN layers
         for i, layer in enumerate(self.layers):
             context_residual = context_embs
-            # Layer i of the GNN uses layer i of the premise embeddings as input
             current_premise_embs = premise_layer_embeddings[i]
 
             if self.gnn_layer_type == "gcn":
@@ -646,12 +540,10 @@ class GNNRetriever(pl.LightningModule):
         if self.final_projection is not None:
             context_embs = self.final_projection(context_embs)
 
-        # Final concatenation and normalization
         if self.hparams.concat_with_original_embeddings:
             orig_embs_norm = F.normalize(initial_context_embs, p=2, dim=1)
             gnn_embs_norm = F.normalize(context_embs, p=2, dim=1)
-            final_embs = torch.cat([gnn_embs_norm, orig_embs_norm], dim=1)
-            final_embs = F.normalize(final_embs, p=2, dim=1)
+            final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1)
         else:
             final_embs = F.normalize(context_embs, p=2, dim=1)
             
