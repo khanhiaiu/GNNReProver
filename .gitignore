@@ -140,3 +140,9 @@ check_duplicates.py
 predictions.pickle
 test_embedding_cache.py
 lightning_logsOLD/
+scripts/run_super_quick_test.sh
+scripts/run_gnn_quick_test.sh
+scripts/create_test_subset.py
+scripts/check_gnn_environment.sh
+retrieval/confs/cli_gnn_quick_test.yaml
+QUICK_TEST_README.md

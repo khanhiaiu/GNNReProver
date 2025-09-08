@@ -189,7 +189,7 @@ class GNNDataModule(pl.LightningDataModule):
         # Temporarily create a dataset with all splits to find unique contexts.
         full_dataset = RetrievalDataset(
             [os.path.join(self.data_path, f"{split}.json") for split in ("train", "val", "test")],
-            self.corpus, 0, 0, 0, None, is_train=False
+            self.corpus, 0, 0, 0, None, is_train=False, graph_dependencies_config=self.graph_dependencies_config
         )
 
         unique_contexts = {ex["context"].serialize(): None for ex in full_dataset.data}
