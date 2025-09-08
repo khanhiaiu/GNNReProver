@@ -8,6 +8,8 @@ def patched_load(*args, **kwargs):
 
 torch.load = patched_load
 
+torch.set_float32_matmul_precision("medium")
+
 
 import torch.nn as nn
 import torch.nn.functional as F
