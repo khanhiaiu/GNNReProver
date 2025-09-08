@@ -39,7 +39,7 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
-        context_neighbor_verbosity: str,
+        graph_dependencies_config: Optional[Dict[str, Any]]
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -48,7 +48,7 @@ class RetrievalDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.is_train = is_train
-        self.context_neighbor_verbosity = context_neighbor_verbosity # Store it
+        self.graph_dependencies_config = graph_dependencies_config
         self.data = list(
             itertools.chain.from_iterable(self._load_data(path) for path in data_paths)
         )
@@ -71,12 +71,15 @@ class RetrievalDataset(Dataset):
                 lctx_premises_names = set()
                 goal_premises_names = set()
 
+                sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
+                context_neighbor_verbosity = sig_cfg.get('verbosity', 'verbose')
+
                 if "before_premises" in tac and tac["before_premises"]:
                     # Each `goal_premises_list` is a list of (premise_name, tag) tuples for one goal.
                     for goal_premises_list in tac["before_premises"]:
                         for premise_name, tag in goal_premises_list:
                             # Filter based on the desired verbosity level ("clickable" or "verbose").
-                            if self.context_neighbor_verbosity in tag:
+                            if context_neighbor_verbosity in tag:
                                 # Distinguish between local context and goal premises.
                                 if "lctx" in tag:
                                     lctx_premises_names.add(premise_name)
@@ -231,8 +234,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
-        context_neighbor_verbosity: str,
-        graph_dependencies: Optional[Dict[str, Any]],
+        graph_dependencies_config: Dict[str, Any],
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -243,7 +245,8 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.eval_batch_size = eval_batch_size
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
-        self.context_neighbor_verbosity = context_neighbor_verbosity
+
+        self.graph_dependencies_config = graph_dependencies_config
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
@@ -251,11 +254,9 @@ class RetrievalDataModule(pl.LightningDataModule):
         # REASONING: This allows the Corpus to be built with GNN-specific parameters
         # during prediction, ensuring consistency with training.
         if corpus_path is not None:
-            if graph_dependencies is None:
-                # Default for non-GNN use cases to maintain backward compatibility.
-                graph_dependencies = {'mode': 'all_dojo'}
-                logger.warning(f"graph_dependencies not provided. Using default: {graph_dependencies}")
-            self.corpus = Corpus(corpus_path, graph_dependencies)
+            if graph_dependencies_config is None:
+                raise ValueError("graph_dependencies_config must be provided when corpus_path is specified.")
+            self.corpus = Corpus(corpus_path, graph_dependencies_config)
         else:
             self.corpus = None
         # ^^^^^^ END MODIFIED SECTION ^^^^^^
@@ -278,7 +279,7 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
-            context_neighbor_verbosity=self.context_neighbor_verbosity,
+            graph_dependencies_config=self.graph_dependencies_config
         )
 
         if stage in (None, "fit", "validate"):
@@ -290,7 +291,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_verbosity=self.context_neighbor_verbosity,
+                graph_dependencies_config=self.graph_dependencies_config
             )
 
         if stage in (None, "fit", "predict"):
@@ -305,7 +306,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_verbosity=self.context_neighbor_verbosity,
+                graph_dependencies_config=self.graph_dependencies_config
             )
 
     def train_dataloader(self) -> DataLoader:

@@ -83,7 +83,7 @@ class PremiseRetriever(pl.LightningModule):
         else:
             return model
 
-    def load_corpus(self, path_or_corpus: Union[str, Corpus], graph_config: Optional[Dict[str, Any]] = None) -> None:
+    def load_corpus(self, path_or_corpus: Union[str, Corpus], graph_config: Dict[str, Any]) -> None:
         """Associate the retriever with a corpus."""
         if isinstance(path_or_corpus, Corpus):
             self.corpus = path_or_corpus
@@ -94,13 +94,14 @@ class PremiseRetriever(pl.LightningModule):
         path = path_or_corpus
         if path.endswith(".jsonl"):  # A raw corpus without embeddings.
             if graph_config is None:
+                raise ValueError("graph_config must be provided when loading a raw corpus.")
                 # Provide a default config if none is given, to avoid crashing simple scripts.
-                logger.warning("graph_config not provided to load_corpus. Using a default configuration.")
-                graph_config = {
-                    'mode': 'custom',
-                    'use_proof_dependencies': True,
-                    'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
-                }
+                #logger.warning("graph_config not provided to load_corpus. Using a default configuration.")
+                #graph_config = {
+                #    'mode': 'custom',
+                #    'use_proof_dependencies': True,
+                #    'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
+                #}
             self.corpus = Corpus(path, graph_config)
             self.corpus_embeddings = None
             self.embeddings_staled = True
@@ -360,32 +361,36 @@ class PremiseRetriever(pl.LightningModule):
 
             # --- START OF NEW LOGGING CODE ---
             if PremiseRetriever._predict_log_counter < PremiseRetriever._max_predict_logs:
-                logger.info("\n" + "="*80)
-                logger.info(f"--- PREDICTION SAMPLE LOG #{PremiseRetriever._predict_log_counter + 1} ---")
+                log_lines = []
+                log_lines.append("=" * 80)
+                log_lines.append(f"--- PREDICTION SAMPLE LOG #{PremiseRetriever._predict_log_counter + 1} ---")
                 
                 # Log the proof state
                 context_text = batch["context"][0].serialize()
-                logger.info(f"Proof State:\n{context_text}")
+                log_lines.append(f"Proof State:\n{context_text}")
                 
                 # Log Local Context (lctx) Premises
                 lctx_premise_names = batch["lctx_premises"][0]
                 if lctx_premise_names:
-                    logger.info("  Local Context (lctx) Premises:")
+                    log_lines.append("  Local Context (lctx) Premises:")
                     for name in lctx_premise_names:
-                        logger.info(f"    - {name}")
+                        log_lines.append(f"    - {name}")
                 else:
-                    logger.info("  Local Context (lctx) Premises: [None]")
+                    log_lines.append("  Local Context (lctx) Premises: [None]")
 
                 # Log Goal Premises
                 goal_premise_names = batch["goal_premises"][0]
                 if goal_premise_names:
-                    logger.info("  Goal Premises:")
+                    log_lines.append("  Goal Premises:")
                     for name in goal_premise_names:
-                        logger.info(f"    - {name}")
+                        log_lines.append(f"    - {name}")
                 else:
-                    logger.info("  Goal Premises: [None]")
+                    log_lines.append("  Goal Premises: [None]")
                 
-                logger.info("="*80 + "\n")
+                log_lines.append("=" * 80)
+                
+                # Single logger call with joined content
+                logger.info("\n" + "\n".join(log_lines))
                 PremiseRetriever._predict_log_counter += 1
             # --- END OF NEW LOGGING CODE ---
             

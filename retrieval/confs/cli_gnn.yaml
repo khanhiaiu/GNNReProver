@@ -54,15 +54,12 @@ data:
   num_workers: 4 
   
   # New parametrization scheme for graph construction
-  graph_dependencies:
+  graph_dependencies_config:
     mode: 'custom'                 # 'all_dojo' or 'custom'
     use_proof_dependencies: true
     signature_and_state:
       verbosity: 'clickable'       # 'clickable', 'verbose', or 'dojo'
       distinguish_lctx_goal: true
-  
-  # Context neighbor verbosity level
-  context_neighbor_verbosity: 'clickable'
 
   attributes:
     use_node_attributes: true      # This key is not used in the GNN model yet but is good practice to include

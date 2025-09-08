@@ -20,9 +20,7 @@ from retrieval.gnn_datamodule import GNNDataModule
 class GNNCLI(LightningCLI):
     def add_arguments_to_parser(self, parser) -> None:
         # Link the graph dependency config from data to model
-        parser.link_arguments("data.graph_dependencies", "model.graph_dependencies")
-        # Link the context verbosity level from data to model
-        parser.link_arguments("data.context_neighbor_verbosity", "model.context_neighbor_verbosity") # Changed name from context_neighbor_type
+        parser.link_arguments("data.graph_dependencies_config", "model.graph_dependencies_config")
         
         # We'll handle edge_types_map separately since it requires corpus instantiation
         
@@ -36,13 +34,13 @@ class GNNCLI(LightningCLI):
         model_config = self.config.get("fit", {}).get("model", self.config.get("model", {}))
         
         corpus_path = data_config["corpus_path"]
-        graph_dependencies = data_config["graph_dependencies"]
+        graph_dependencies_config = data_config["graph_dependencies_config"]
         
         logger.info(f"Loading corpus from: {corpus_path}")
-        logger.info(f"Graph dependencies config: {graph_dependencies}")
+        logger.info(f"Graph dependencies config: {graph_dependencies_config}")
         
         from common import Corpus
-        corpus = Corpus(corpus_path, graph_dependencies)
+        corpus = Corpus(corpus_path, graph_dependencies_config)
         logger.info(f"Corpus loaded successfully. Edge types map: {corpus.edge_types_map}")
         
         # --- START: ADDED LOGGING ---

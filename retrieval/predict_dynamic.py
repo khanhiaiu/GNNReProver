@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument("--data_path", type=str, required=True, help="Path to the data to predict on (e.g., data/leandojo_benchmark_4/random/).")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the final prediction pickle file.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for prediction.")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for the dataloader.")
+    parser.add_argument("--num_workers", type=int, default=10, help="Number of workers for the dataloader.")
     args = parser.parse_args()
     logger.info(f"Starting dynamic prediction with arguments: {args}")
 
@@ -64,7 +64,13 @@ def main() -> None:
     # Attach the GNN to the retriever. The retriever's predict_step will use it.
     retriever.gnn_model = gnn_model
     logger.info("Successfully loaded and attached GNN model to the retriever.")
-    logger.info(f"Using verbosity for context neighbors: {data_hparams['context_neighbor_verbosity']}")
+
+    graph_dependencies_config=data_hparams['graph_dependencies_config']
+    logger.info(f"Using graph_dependencies_config for prediction: {graph_dependencies_config}")
+
+    sig_cfg = graph_dependencies_config.get('signature_and_state', {})
+    context_neighbor_verbosity = sig_cfg.get('verbosity', 'verbose')
+    logger.info(f"Context neighbor verbosity set to: {context_neighbor_verbosity}")
 
     # --- Step 2: Setup the datamodule with the exact configuration from training ---
     # This is the crucial step for consistency. We use the loaded hyperparameters
@@ -77,8 +83,7 @@ def main() -> None:
         eval_batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_seq_len=2048, 
-        graph_dependencies=data_hparams['graph_dependencies'],
-        context_neighbor_verbosity=data_hparams['context_neighbor_verbosity'],
+        graph_dependencies_config=graph_dependencies_config,
         num_negatives=0,  # Not needed for prediction
         num_in_file_negatives=0,  # Not needed for prediction
     )

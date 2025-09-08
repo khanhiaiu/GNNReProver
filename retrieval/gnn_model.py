@@ -33,10 +33,9 @@ class GNNRetriever(pl.LightningModule):
         self,
         feature_size: int,
         num_layers: int,
-        graph_dependencies: Dict[str, Any],
-        context_neighbor_verbosity: str, 
+        graph_dependencies_config: Dict[str, Any], 
         edge_type_to_id: Dict[str, int],
-        lr : float,
+        lr : float, # Why is this unused?
         warmup_steps : int,
         gnn_layer_type: str = "rgcn",
         hidden_size: Optional[int] = None,
@@ -59,8 +58,7 @@ class GNNRetriever(pl.LightningModule):
         self.num_layers = num_layers
         self.gnn_layer_type = gnn_layer_type.lower()
         self.use_edge_attr = use_edge_attr
-        self.graph_dependencies_config = graph_dependencies
-        self.context_neighbor_verbosity = context_neighbor_verbosity
+        self.graph_dependencies_config = graph_dependencies_config
         self.num_relations = num_relations
         self.gat_heads = gat_heads
         self.use_residual = use_residual
@@ -265,10 +263,13 @@ class GNNRetriever(pl.LightningModule):
         new_edges_src = []
         new_edges_dst = []
         new_edge_attrs = []
+
+        sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
+        context_neighbor_verbosity = sig_cfg.get('verbosity', 'verbose')
         
         # Dynamically create tags based on the configured verbosity
-        lctx_tag = f"signature_{self.context_neighbor_verbosity}_lctx"
-        goal_tag = f"signature_{self.context_neighbor_verbosity}_goal"
+        lctx_tag = f"signature_{context_neighbor_verbosity}_lctx"
+        goal_tag = f"signature_{context_neighbor_verbosity}_goal"
 
         # Determine edge types using the common helper function
         lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)

@@ -256,14 +256,15 @@ class Corpus:
             path = file_data["path"]
             assert not dep_graph.has_node(path)
             
-            if not dep_graph.has_node(path):
-                file = File.from_data(file_data)
-                dep_graph.add_node(path, file=file)
-                all_premises_with_duplicates.extend(file.premises)
+            #if not dep_graph.has_node(path):
+            file = File.from_data(file_data)
+            dep_graph.add_node(path, file=file)
+            all_premises_with_duplicates.extend(file.premises)
 
             for p_import in file_data["imports"]:
-                if not dep_graph.has_node(p_import):
-                    dep_graph.add_node(p_import, file=None)
+                assert dep_graph.has_node(p_import)
+                #if not dep_graph.has_node(p_import):
+                #    dep_graph.add_node(p_import, file=None)
                 dep_graph.add_edge(path, p_import)
         
         unique_premises_dict = {p.full_name: p for p in all_premises_with_duplicates}
@@ -294,8 +295,9 @@ class Corpus:
             return edge_types_map[edge_name]
 
         for p1 in self.all_premises:
-            if p1.full_name not in self.name2idx:
-                continue
+            assert p1.full_name in self.name2idx, f"Premise {p1.full_name} not found in name2idx"
+            #if p1.full_name not in self.name2idx:
+            #    continue
             p1_idx = self.name2idx[p1.full_name]
 
             for p2_name, tag in p1.dependencies:

@@ -54,7 +54,6 @@ def gnn_collate_fn(
         indices = [
             corpus.name2idx[name]
             for name in ex["lctx_premises"]
-            if name in corpus.name2idx
         ]
         lctx_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
     batch["lctx_neighbor_indices"] = lctx_neighbor_indices
@@ -64,7 +63,6 @@ def gnn_collate_fn(
         indices = [
             corpus.name2idx[name]
             for name in ex["goal_premises"]
-            if name in corpus.name2idx
         ]
         goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
     batch["goal_neighbor_indices"] = goal_neighbor_indices
@@ -110,8 +108,7 @@ class GNNDataModule(pl.LightningDataModule):
         batch_size: int,
         eval_batch_size: int,
         num_workers: int,
-        graph_dependencies: Dict[str, Any],
-        context_neighbor_verbosity: str,
+        graph_dependencies_config: Dict[str, Any],
         attributes: Dict[str, Any],
     ) -> None:
         super().__init__()
@@ -121,10 +118,11 @@ class GNNDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.num_workers = num_workers
-        self.context_neighbor_verbosity = context_neighbor_verbosity
         self.retriever_ckpt_path = retriever_ckpt_path
 
-        self.corpus = Corpus(corpus_path, graph_dependencies)
+        self.graph_dependencies_config = graph_dependencies_config
+
+        self.corpus = Corpus(corpus_path, graph_dependencies_config)
         # Expose edge_types_map at datamodule level for CLI linking
         self.edge_types_map = self.corpus.edge_types_map
         
@@ -166,7 +164,7 @@ class GNNDataModule(pl.LightningDataModule):
                 max_seq_len=0,
                 tokenizer=None,
                 is_train=True,
-                context_neighbor_verbosity=self.context_neighbor_verbosity,
+                graph_dependencies_config=self.graph_dependencies_config
             )
 
     def _generate_and_cache_premise_embeddings(self) -> None:
