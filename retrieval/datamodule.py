@@ -1,4 +1,4 @@
-"""Datamodule for the premise retrieval."""
+# retrieval/datamodule.py
 
 import os
 import json
@@ -21,7 +21,7 @@ from copy import deepcopy
 from lean_dojo import Pos
 import pytorch_lightning as pl
 from lean_dojo import LeanGitRepo
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Any # <<< MODIFIED: Added Dict, Any
 from transformers import AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -231,7 +231,8 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
-        context_neighbor_verbosity: str = "verbose", # Add parameter
+        context_neighbor_verbosity: str = "verbose",
+        graph_dependencies: Optional[Dict[str, Any]] = None,  # <<< ADDED ARGUMENT
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -242,10 +243,22 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.eval_batch_size = eval_batch_size
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
-        self.context_neighbor_verbosity = context_neighbor_verbosity # Store parameter
+        self.context_neighbor_verbosity = context_neighbor_verbosity
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.corpus = Corpus(corpus_path) if corpus_path is not None else None
+        
+        # vvvvvv MODIFIED SECTION vvvvvv
+        # REASONING: This allows the Corpus to be built with GNN-specific parameters
+        # during prediction, ensuring consistency with training.
+        if corpus_path is not None:
+            if graph_dependencies is None:
+                # Default for non-GNN use cases to maintain backward compatibility.
+                graph_dependencies = {'mode': 'all_dojo'}
+                logger.warning(f"graph_dependencies not provided. Using default: {graph_dependencies}")
+            self.corpus = Corpus(corpus_path, graph_dependencies)
+        else:
+            self.corpus = None
+        # ^^^^^^ END MODIFIED SECTION ^^^^^^
 
         metadata = json.load(open(os.path.join(data_path, "../metadata.json")))
         repo = LeanGitRepo(**metadata["from_repo"])
@@ -265,7 +278,7 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
-            context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
+            context_neighbor_verbosity=self.context_neighbor_verbosity,
         )
 
         if stage in (None, "fit", "validate"):
@@ -277,7 +290,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
+                context_neighbor_verbosity=self.context_neighbor_verbosity,
             )
 
         if stage in (None, "fit", "predict"):
@@ -292,7 +305,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                context_neighbor_verbosity=self.context_neighbor_verbosity, # Pass parameter
+                context_neighbor_verbosity=self.context_neighbor_verbosity,
             )
 
     def train_dataloader(self) -> DataLoader:

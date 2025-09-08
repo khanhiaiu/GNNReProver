@@ -432,7 +432,6 @@ class PremiseRetriever(pl.LightningModule):
 
         batch_outputs = []
         
-        items_in_batch = 0
         for (
             url,
             commit,
@@ -474,14 +473,10 @@ class PremiseRetriever(pl.LightningModule):
                 "retrieved_premises": premises,
                 "scores": s,
             }
-            items_in_batch += 1 # 
             self.predict_step_outputs.append(prediction_item) # Keep this for backward compatibility
             batch_outputs.append(prediction_item)  
 
-        logger.info(
-            f"Worker PID: {os.getpid()} "
-            f"Worker's local list size: {len(self.predict_step_outputs)} {len(batch_outputs)}"
-        )
+
         return batch_outputs
 
     def on_predict_epoch_end(self) -> None:
