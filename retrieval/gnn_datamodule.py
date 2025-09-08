@@ -54,6 +54,7 @@ def gnn_collate_fn(
         indices = [
             corpus.name2idx[name]
             for name in ex["lctx_premises"]
+            if name in corpus.name2idx
         ]
         lctx_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
     batch["lctx_neighbor_indices"] = lctx_neighbor_indices
@@ -63,6 +64,7 @@ def gnn_collate_fn(
         indices = [
             corpus.name2idx[name]
             for name in ex["goal_premises"]
+            if name in corpus.name2idx
         ]
         goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
     batch["goal_neighbor_indices"] = goal_neighbor_indices
@@ -170,8 +172,8 @@ class GNNDataModule(pl.LightningDataModule):
     def _generate_and_cache_premise_embeddings(self) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         retriever = PremiseRetriever.load_hf(self.retriever_ckpt_path, 2048, device)
-        retriever.load_corpus(self.corpus)
-        
+        retriever.load_corpus(self.corpus, self.graph_dependencies_config)
+
         logger.info("Generating initial premise embeddings for GNN training...")
         # This reuses the same robust logic from the PremiseRetriever class
         retriever.reindex_corpus(batch_size=self.eval_batch_size)
