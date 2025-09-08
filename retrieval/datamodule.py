@@ -39,7 +39,7 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
-        context_neighbor_verbosity: str = "verbose",
+        context_neighbor_verbosity: str,
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -231,8 +231,8 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
-        context_neighbor_verbosity: str = "verbose",
-        graph_dependencies: Optional[Dict[str, Any]] = None,  # <<< ADDED ARGUMENT
+        context_neighbor_verbosity: str,
+        graph_dependencies: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__()
         self.data_path = data_path
