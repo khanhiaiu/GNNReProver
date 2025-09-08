@@ -38,6 +38,7 @@ model:
   hidden_size: 512  # Hidden layer size (default: same as feature_size)
   use_residual: true  # Whether to use residual/skip connections
   dropout_p: 0.5  # Dropout probability
+  edge_dropout_p: 0.1  # Edge dropout probability
   norm_type: layer  # Normalization type: "none", "batch", "layer", "instance", "group"
   use_initial_projection: true  # Whether to apply initial projection to embeddings
   concat_with_original_embeddings: true # <-- ADD THIS LINE
@@ -56,7 +57,7 @@ data:
   # New parametrization scheme for graph construction
   graph_dependencies_config:
     mode: 'custom'                 # 'all_dojo' or 'custom'
-    use_proof_dependencies: true
+    use_proof_dependencies: false
     signature_and_state:
       verbosity: 'clickable'       # 'clickable', 'verbose', or 'dojo'
       distinguish_lctx_goal: true

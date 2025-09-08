@@ -46,6 +46,7 @@ class GNNRetriever(pl.LightningModule):
         gat_heads: int = 8,
         use_residual: bool = True,
         dropout_p: float = 0.5,
+        edge_dropout_p: float = 0.1,
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         concat_with_original_embeddings: bool = False,
@@ -65,6 +66,7 @@ class GNNRetriever(pl.LightningModule):
         self.gat_heads = gat_heads
         self.use_residual = use_residual
         self.dropout_p = dropout_p
+        self.edge_dropout_p = edge_dropout_p
         self.norm_type = norm_type.lower() if norm_type else "none"
         self.use_initial_projection = use_initial_projection
         self.edge_type_to_id = edge_type_to_id
@@ -149,6 +151,18 @@ class GNNRetriever(pl.LightningModule):
                 
             input_size = self.hidden_size
 
+    def _apply_edge_dropout(self, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
+        if not self.training or self.edge_dropout_p == 0.0:
+            return edge_index, edge_attr
+        
+        num_edges = edge_index.size(1)
+        keep_prob = 1.0 - self.edge_dropout_p
+        edge_mask = torch.rand(num_edges, device=edge_index.device) < keep_prob
+        
+        dropped_edge_index = edge_index[:, edge_mask]
+        dropped_edge_attr = edge_attr[edge_mask] if edge_attr is not None else None
+        return dropped_edge_index, dropped_edge_attr
+
     # --- OPTIMIZATION 3: Refactor GNN Layer Application ---
     def _apply_gnn_layer(self, layer: nn.Module, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """Applies a single GNN layer based on its type, centralizing logic."""
@@ -174,11 +188,14 @@ class GNNRetriever(pl.LightningModule):
         if self.initial_projection is not None:
             x = self.initial_projection(x)
         
+        # Apply edge dropout once for all layers
+        dropped_edge_index, dropped_edge_attr = self._apply_edge_dropout(edge_index, edge_attr)
+        
         for i, layer in enumerate(self.layers):
             x_residual = x
             
-            # Use the refactored helper method
-            x = self._apply_gnn_layer(layer, x, edge_index, edge_attr)
+            # Use the refactored helper method with dropped edges
+            x = self._apply_gnn_layer(layer, x, dropped_edge_index, dropped_edge_attr)
             
             if self.norm_layers is not None and i < len(self.norm_layers):
                 x = self.norm_layers[i](x)
