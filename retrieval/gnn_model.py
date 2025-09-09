@@ -197,6 +197,9 @@ class GNNRetriever(pl.LightningModule):
         Apply GNN layers with optional initial projection, residual connections, 
         normalization, activation and dropout.
         """
+        target_dtype = next(self.parameters()).dtype
+        x = x.to(target_dtype)
+
         x_orig = x
         
         if self.initial_projection is not None:
