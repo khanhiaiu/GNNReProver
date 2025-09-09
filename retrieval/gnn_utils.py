@@ -2,7 +2,7 @@ from typing import List, Optional
 
 import torch
 from torch import Tensor
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, SAGEConv
 from torch_geometric.utils import add_remaining_self_loops, scatter
 
 def compute_ghost_node_embeddings_gcn(
@@ -122,6 +122,50 @@ def compute_ghost_node_embeddings_gcn(
     ghost_node_outputs = out[num_existing_nodes:]
 
     return ghost_node_outputs
+
+def compute_ghost_node_embeddings_graphsage(
+    sage_layer: SAGEConv,
+    existing_node_embs: Tensor,
+    ghost_node_initial_embs: List[Tensor],
+    ghost_node_connections: List[Tensor],
+) -> Tensor:
+    """
+    Efficiently computes ghost node embeddings for a SAGEConv layer.
+    """
+    if not ghost_node_initial_embs:
+        return torch.empty(0, sage_layer.out_channels, device=existing_node_embs.device)
+
+    device = existing_node_embs.device
+    num_ghost_nodes = len(ghost_node_initial_embs)
+    ghost_embs_tensor = torch.stack(ghost_node_initial_embs).to(device)
+
+    # --- 1. Aggregate messages (neighbor features) ---
+    # `aggr` defaults to 'mean' in SAGEConv, which is what we replicate here.
+    source_indices_list = [conn.to(device) for conn in ghost_node_connections if conn.numel() > 0]
+    
+    if source_indices_list:
+        source_indices = torch.cat(source_indices_list)
+        dest_indices = torch.cat([
+            torch.full_like(conn, i) for i, conn in enumerate(ghost_node_connections) if conn.numel() > 0
+        ]).to(device)
+        
+        source_features = existing_node_embs[source_indices]
+        aggregated_messages = scatter(source_features, dest_indices, dim=0, dim_size=num_ghost_nodes, reduce=sage_layer.aggr)
+    else:
+        # If no neighbors, the aggregated message is a zero vector
+        aggregated_messages = torch.zeros(num_ghost_nodes, existing_node_embs.size(1), device=device)
+
+    # --- 2. Apply GraphSAGE update rule ---
+    # out = W_l * aggr_neighbors + W_r * self_features
+    out = sage_layer.lin_l(aggregated_messages) + sage_layer.lin_r(ghost_embs_tensor)
+
+    if sage_layer.normalize:
+        out = torch.nn.functional.normalize(out, p=2, dim=-1)
+    
+    if sage_layer.bias is not None:
+        out = out + sage_layer.bias
+        
+    return out
 
 from typing import List, Optional, Tuple
 

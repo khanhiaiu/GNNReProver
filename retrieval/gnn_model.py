@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Dict, Any, List, Tuple, Optional
-from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv
+from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv, SAGEConv
 
 from common import _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
 
@@ -27,6 +27,7 @@ from retrieval.gnn_utils import (
         compute_ghost_node_embeddings_gat,
         compute_ghost_node_embeddings_rgat,
         compute_ghost_node_embeddings_gin,
+        compute_ghost_node_embeddings_graphsage,
     )
 
 
@@ -120,6 +121,7 @@ class GNNRetriever(pl.LightningModule):
             "gat": (GATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "concat": False}),
             "rgat": (RGATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "num_relations": num_relations, "concat": False}),
             "gin": (GINConv, {}),  # GIN requires a special case for its MLP
+            "graphsage": (SAGEConv, {"out_channels": self.hidden_size}),
         }
 
         if self.gnn_layer_type not in layer_configs:
@@ -172,7 +174,7 @@ class GNNRetriever(pl.LightningModule):
     # --- OPTIMIZATION 3: Refactor GNN Layer Application ---
     def _apply_gnn_layer(self, layer: nn.Module, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """Applies a single GNN layer based on its type, centralizing logic."""
-        if self.gnn_layer_type in ["gcn", "gat", "gin"]:
+        if self.gnn_layer_type in ["gcn", "gat", "gin", "graphsage"]:
             return layer(x, edge_index)
         elif self.gnn_layer_type in ["rgcn", "rgat"]:
             if self.use_edge_attr and edge_attr is not None:
@@ -577,6 +579,9 @@ class GNNRetriever(pl.LightningModule):
                 context_embs = compute_ghost_node_embeddings_gcn(layer, current_premise_embs, None, context_embs.unbind(0), simple_conns)
             elif self.gnn_layer_type == "rgcn":
                 context_embs = compute_ghost_node_embeddings_rgcn(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
+            elif self.gnn_layer_type == "graphsage":
+                simple_conns = [con[0] for con in batch_connections]
+                context_embs = compute_ghost_node_embeddings_graphsage(layer, current_premise_embs, context_embs.unbind(0), simple_conns)
             elif self.gnn_layer_type == "gat":
                 simple_conns = [con[0] for con in batch_connections]
                 context_embs = compute_ghost_node_embeddings_gat(layer, current_premise_embs, context_embs.unbind(0), simple_conns)
