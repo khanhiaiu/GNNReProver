@@ -54,10 +54,12 @@ echo "================================================================="
 # --- 2. Setup Environment and Paths ---
 export CUDA_VISIBLE_DEVICES=$CUDA_INDEX
 export PYTHONPATH=$(pwd):$PYTHONPATH
+# Suppress Python warnings to reduce log pollution
+export PYTHONWARNINGS="ignore"
 
 # Create a highly descriptive experiment name and log directory.
 EXP_NAME="${UNIQUE_NAME_TAG}_${NUM_LAYERS}layers_${SPLIT_TYPE}"
-LOG_DIR="lightning_logs/2025-08-30_${EXP_NAME}"
+LOG_DIR="lightning_logs/$(date +'%Y-%m-%d')_${EXP_NAME}"
 
 # Define paths based on the chosen split
 DATA_PATH="data/leandojo_benchmark_4/${SPLIT_TYPE}"
@@ -78,12 +80,12 @@ echo "W&B Run Name will be: $EXP_NAME"
 echo "Overriding GNN layers to: $NUM_LAYERS"
 echo "------------------------------------------------"
 
-#python retrieval/train_gnn.py fit \
-#    --config $GNN_CONFIG \
-#    --model.num_layers $NUM_LAYERS \
-#    --data.data_path "$DATA_PATH/" \
-#    --trainer.logger.name "$EXP_NAME" \
-#    --trainer.logger.save_dir "$LOG_DIR"
+python retrieval/train_gnn.py fit \
+    --config $GNN_CONFIG \
+    --model.num_layers $NUM_LAYERS \
+    --data.data_path "$DATA_PATH/" \
+    --trainer.logger.name "$EXP_NAME" \
+    --trainer.logger.save_dir "$LOG_DIR" 
 
 # --- 4. Find Checkpoint and Saved Config ---
 echo "Training complete. Searching for artifacts..."

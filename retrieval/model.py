@@ -340,15 +340,25 @@ class PremiseRetriever(pl.LightningModule):
             final_premise_embs = self.premise_layer_embeddings[-1]
 
             # Overwrite self.corpus_embeddings with the final GNN-refined embeddings for KNN search.
-            if self.gnn_model.hparams.concat_with_original_embeddings:
+            postprocess_option = self.gnn_model.hparams.postprocess_gnn_embeddings
+            
+            if postprocess_option == "gnn":
+                self.corpus_embeddings = F.normalize(final_premise_embs, p=2, dim=1)
+            else:
                 original_embs_norm = F.normalize(self.corpus_embeddings, p=2, dim=1)
                 final_gnn_embs_norm = F.normalize(final_premise_embs, p=2, dim=1)
-                # Ensure dtypes and devices match for concat
+                # Ensure dtypes and devices match for fusion
                 original_embs_norm = original_embs_norm.to(final_gnn_embs_norm.device, final_gnn_embs_norm.dtype)
-                concatenated_embs = torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1)
-                self.corpus_embeddings = F.normalize(concatenated_embs, p=2, dim=1)
-            else:
-                self.corpus_embeddings = F.normalize(final_premise_embs, p=2, dim=1)
+
+                if postprocess_option == "concat":
+                    concatenated_embs = torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1)
+                    self.corpus_embeddings = F.normalize(concatenated_embs, p=2, dim=1)
+                elif postprocess_option == "gating":
+                    gate = torch.sigmoid(self.gnn_model.gating_layer(torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1)))
+                    fused_embs = final_gnn_embs_norm + gate * original_embs_norm
+                    self.corpus_embeddings = F.normalize(fused_embs, p=2, dim=1)
+                else:
+                    raise ValueError(f"Unknown postprocessing option: {postprocess_option}")
             
             logger.info(f"Cached {len(self.premise_layer_embeddings)} sets of premise embeddings.")
 

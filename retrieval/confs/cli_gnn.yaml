@@ -18,7 +18,7 @@ trainer:
       name: gnn_retriever1
       save_dir: "lightning_logs/gnn_retriever"
   gradient_clip_val: 1.0
-  max_steps: 200000
+  max_steps: 100000 # TODO increase this back to 200000
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
       init_args:
@@ -41,7 +41,7 @@ model:
   edge_dropout_p: 0.1  # Edge dropout probability
   norm_type: layer  # Normalization type: "none", "batch", "layer", "instance", "group"
   use_initial_projection: true  # Whether to apply initial projection to embeddings
-  concat_with_original_embeddings: true # <-- ADD THIS LINE
+  postprocess_gnn_embeddings: concat # Options: "gnn", "concat", "gating"
 
 
 data:
@@ -52,7 +52,7 @@ data:
   num_in_file_negatives: 1
   batch_size: 16
   eval_batch_size: 4
-  num_workers: 4 
+  num_workers: 6 
   
   # New parametrization scheme for graph construction
   graph_dependencies_config:

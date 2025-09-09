@@ -50,7 +50,7 @@ class GNNRetriever(pl.LightningModule):
         lm_mask_p: float = 0.5,
         norm_type: str = "layer",
         use_initial_projection: bool = True,
-        concat_with_original_embeddings: bool = False,
+        postprocess_gnn_embeddings: str = "gnn",
         num_logs_per_epoch: int = 5,
     ) -> None:
         super().__init__()
@@ -72,6 +72,10 @@ class GNNRetriever(pl.LightningModule):
         self.norm_type = norm_type.lower() if norm_type else "none"
         self.use_initial_projection = use_initial_projection
         self.edge_type_to_id = edge_type_to_id
+
+        if self.hparams.postprocess_gnn_embeddings == "gating":
+            # Gating layer input is the concatenation of GNN and original embeddings
+            self.gating_layer = nn.Linear(self.feature_size * 2, self.feature_size)
 
         # Initial projection layer (optional)
         if self.use_initial_projection:
@@ -342,25 +346,35 @@ class GNNRetriever(pl.LightningModule):
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
         gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
-        if self.hparams.concat_with_original_embeddings:
-            # Normalize original embeddings
+        if self.hparams.postprocess_gnn_embeddings == "gnn":
+            final_premise_embs = gnn_premise_embs
+            final_context_embs = gnn_context_embs
+        else:
+            # Both 'concat' and 'gating' need the original embeddings
             original_premise_embs = F.normalize(node_features.to(gnn_premise_embs.device), p=2, dim=1)
             original_context_embs = F.normalize(context_features.to(gnn_context_embs.device), p=2, dim=1)
 
-            # Stochastic LM masking during training: replace original embeddings with zeros with probability lm_mask_p
+            # Stochastic LM masking during training
             if self.training and (self.lm_mask_p is not None) and (self.lm_mask_p > 0.0):
-                # Use device-aligned uniform random draw
-                rand_val = torch.rand(1, device=gnn_premise_embs.device).item()
-                if rand_val < float(self.lm_mask_p):
+                if torch.rand(1, device=gnn_premise_embs.device).item() < float(self.lm_mask_p):
                     original_premise_embs = torch.zeros_like(original_premise_embs)
                     original_context_embs = torch.zeros_like(original_context_embs)
+            
+            if self.hparams.postprocess_gnn_embeddings == "concat":
+                final_premise_embs = F.normalize(torch.cat([gnn_premise_embs, original_premise_embs], dim=1), p=2, dim=1)
+                final_context_embs = F.normalize(torch.cat([gnn_context_embs, original_context_embs], dim=1), p=2, dim=1)
+            elif self.hparams.postprocess_gnn_embeddings == "gating":
+                # Fuse premise embeddings
+                gate_premise = torch.sigmoid(self.gating_layer(torch.cat([gnn_premise_embs, original_premise_embs], dim=1)))
+                fused_premise_embs = gnn_premise_embs + gate_premise * original_premise_embs
+                final_premise_embs = F.normalize(fused_premise_embs, p=2, dim=1)
 
-            # Concatenate GNN outputs with (possibly masked) originals and normalize
-            final_premise_embs = F.normalize(torch.cat([gnn_premise_embs, original_premise_embs], dim=1), p=2, dim=1)
-            final_context_embs = F.normalize(torch.cat([gnn_context_embs, original_context_embs], dim=1), p=2, dim=1)
-        else:
-            final_premise_embs = gnn_premise_embs
-            final_context_embs = gnn_context_embs
+                # Fuse context embeddings
+                gate_context = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_context_embs], dim=1)))
+                fused_context_embs = gnn_context_embs + gate_context * original_context_embs
+                final_context_embs = F.normalize(fused_context_embs, p=2, dim=1)
+            else:
+                 raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
 
         pos_premise_emb = final_premise_embs[pos_premise_indices]
         neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
@@ -426,14 +440,28 @@ class GNNRetriever(pl.LightningModule):
         )
         x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
         _, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
-        final_context_emb = gnn_context_embs[0]
 
-        if self.hparams.concat_with_original_embeddings:
-            original_context_emb = F.normalize(initial_context_emb.unsqueeze(0).to(final_context_emb.device), p=2, dim=1)
-            concatenated_emb = torch.cat([final_context_emb.unsqueeze(0), original_context_emb], dim=1)
-            final_context_emb = F.normalize(concatenated_emb, p=2, dim=1).squeeze(0)
+        postprocess_option = self.hparams.postprocess_gnn_embeddings
+        if postprocess_option == "gnn":
+            final_context_emb = gnn_context_embs
+        else:
+            # Both 'concat' and 'gating' need the original embeddings
+            original_context_emb = F.normalize(initial_context_emb.unsqueeze(0).to(gnn_context_embs.device), p=2, dim=1)
+            
+            if postprocess_option == "concat":
+                concatenated_emb = torch.cat([gnn_context_embs, original_context_emb], dim=1)
+                final_context_emb = F.normalize(concatenated_emb, p=2, dim=1)
+            elif postprocess_option == "gating":
+                gate = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_context_emb], dim=1)))
+                fused_emb = gnn_context_embs + gate * original_context_emb
+                final_context_emb = F.normalize(fused_emb, p=2, dim=1)
+            else:
+                # Fallback to just GNN embeddings if option is unknown
+                final_context_emb = gnn_context_embs
 
-        logger.info(f"  Final GNN Context Embedding (first 8 values):   {final_context_emb[:8].cpu().numpy()}")
+        final_context_emb_vec = final_context_emb.squeeze(0)
+
+        logger.info(f"  Final GNN Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}")
         logger.info("--- End of Training Sample Log ---")
         self.train()
 
@@ -570,11 +598,20 @@ class GNNRetriever(pl.LightningModule):
         if self.final_projection is not None:
             context_embs = self.final_projection(context_embs)
 
-        if self.hparams.concat_with_original_embeddings:
+        if self.hparams.postprocess_gnn_embeddings == "gnn":
+            final_embs = F.normalize(context_embs, p=2, dim=1)
+        else:
+            # Both 'concat' and 'gating' need the original embeddings
             orig_embs_norm = F.normalize(initial_context_embs, p=2, dim=1)
             gnn_embs_norm = F.normalize(context_embs, p=2, dim=1)
-            final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1)
-        else:
-            final_embs = F.normalize(context_embs, p=2, dim=1)
+
+            if self.hparams.postprocess_gnn_embeddings == "concat":
+                final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1)
+            elif self.hparams.postprocess_gnn_embeddings == "gating":
+                gate = torch.sigmoid(self.gating_layer(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1)))
+                fused_embs = gnn_embs_norm + gate * orig_embs_norm
+                final_embs = F.normalize(fused_embs, p=2, dim=1)
+            else:
+                raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
             
         return final_embs
