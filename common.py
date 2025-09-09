@@ -490,7 +490,11 @@ def format_augmented_state(
 
 
 def get_optimizers(
-    parameters, trainer: pl.Trainer, lr: float, warmup_steps: int
+    parameters,
+    trainer: pl.Trainer,
+    lr: float,
+    warmup_steps: int,
+    weight_decay: float = 0.0,
 ) -> Dict[str, Any]:
     """Return an AdamW optimizer with cosine warmup learning rate schedule."""
     strategy = trainer.strategy
@@ -498,13 +502,17 @@ def get_optimizers(
     if isinstance(strategy, DeepSpeedStrategy):
         if "offload_optimizer" in strategy.config["zero_optimization"]:
             logger.info("Optimizing with DeepSpeedCPUAdam")
-            optimizer = DeepSpeedCPUAdam(parameters, lr=lr, adamw_mode=True)
+            optimizer = DeepSpeedCPUAdam(
+                parameters, lr=lr, adamw_mode=True, weight_decay=weight_decay
+            )
         else:
             logger.info("Optimizing with FusedAdam")
-            optimizer = FusedAdam(parameters, lr=lr, adam_w_mode=True)
+            optimizer = FusedAdam(
+                parameters, lr=lr, adam_w_mode=True, weight_decay=weight_decay
+            )
     else:
         logger.info("Optimizing with AdamW")
-        optimizer = torch.optim.AdamW(parameters, lr=lr)
+        optimizer = torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
 
     scheduler = get_constant_schedule_with_warmup(optimizer, warmup_steps)
     return {

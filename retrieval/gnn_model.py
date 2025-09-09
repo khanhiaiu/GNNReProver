@@ -1,4 +1,6 @@
 import torch
+from torch_geometric.data import Data
+
 
 # Monkeypatch torch.load before Lightning/DeepSpeed calls it
 _orig_load = torch.load
@@ -32,6 +34,8 @@ from retrieval.gnn_utils import (
 
 
 class GNNRetriever(pl.LightningModule):
+# In retrieval/gnn_model.py
+
     def __init__(
         self,
         feature_size: int,
@@ -40,6 +44,8 @@ class GNNRetriever(pl.LightningModule):
         edge_type_to_id: Dict[str, int],
         lr : float,
         warmup_steps : int,
+        l1_lambda: float = 0.0,
+        weight_decay: float = 0.0,
         gnn_layer_type: str = "rgcn",
         hidden_size: Optional[int] = None,
         num_relations: int = 3,
@@ -467,22 +473,54 @@ class GNNRetriever(pl.LightningModule):
         logger.info("--- End of Training Sample Log ---")
         self.train()
 
+# In retrieval/gnn_model.py
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         if hasattr(self, "logging_steps") and batch_idx in self.logging_steps:
             if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
                 self._log_training_sample(batch, batch_idx)
 
-        loss = self(
+        mse_loss = self(
             batch["node_features"], batch["edge_index"], batch["context_features"],
             batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
             batch["pos_premise_indices"], batch["neg_premises_indices"],
             batch["label"], batch.get("edge_attr", None),
         )
-        self.log("loss_train", loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
-        return loss
+        self.log("mse_loss_train", mse_loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
 
+        # --- L1 REGULARIZATION ---
+        total_loss = mse_loss
+        if self.hparams.l1_lambda > 0:
+            l1_penalty = 0.0
+            # We regularize the weights of GNN layers and projection layers.
+            modules_to_regularize = list(self.layers)
+            if self.initial_projection is not None:
+                modules_to_regularize.append(self.initial_projection)
+            if self.residual_projection is not None:
+                modules_to_regularize.append(self.residual_projection)
+            if self.final_projection is not None:
+                modules_to_regularize.append(self.final_projection)
+            if hasattr(self, 'gating_layer'):
+                 modules_to_regularize.append(self.gating_layer)
+
+            for module in modules_to_regularize:
+                for name, param in module.named_parameters():
+                    if 'weight' in name:
+                        l1_penalty += torch.norm(param, 1)
+            
+            l1_loss = self.hparams.l1_lambda * l1_penalty
+            self.log("l1_loss_train", l1_loss, on_step=True, on_epoch=True, sync_dist=True)
+            total_loss = mse_loss + l1_loss
+        # --- END L1 REGULARIZATION ---
+        
+        self.log("loss_train", total_loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
+        return total_loss
+
+    # In retrieval/gnn_model.py
     def configure_optimizers(self) -> Dict[str, Any]:
-        return get_optimizers(self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps)
+        return get_optimizers(
+            self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps, weight_decay=self.hparams.weight_decay
+        )
     
     @torch.no_grad()
     def compute_premise_layer_embeddings(
