@@ -39,7 +39,18 @@ def main() -> None:
     else:
         device = torch.device("cuda")
     model = PremiseRetriever.load_hf(args.ckpt_path, 2048, device)
-    model.load_corpus(args.corpus_path)
+    
+    # Provide a default graph config for baseline retrieval
+    default_graph_config = {
+        'mode': 'custom',
+        'use_proof_dependencies': False,
+        'signature_and_state': {
+            'verbosity': 'clickable',
+            'distinguish_lctx_goal': True
+        }
+    }
+    
+    model.load_corpus(args.corpus_path, default_graph_config)
     model.reindex_corpus(batch_size=args.batch_size)
 
     pickle.dump(
