@@ -60,6 +60,7 @@ class GNNRetriever(pl.LightningModule):
         use_initial_projection: bool = True,
         postprocess_gnn_embeddings: str = "gnn",
         num_logs_per_epoch: int = 5,
+        neighbor_sampling_sizes: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -168,6 +169,59 @@ class GNNRetriever(pl.LightningModule):
                 
             input_size = self.hidden_size
 
+    def _sample_neighbors(
+        self,
+        edge_index: torch.LongTensor,
+        edge_attr: Optional[torch.LongTensor],
+        k: int,
+    ) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
+        """
+        Samples k incoming neighbors for each node, respecting relation types if available.
+        If k is negative, returns the original graph. This is only active during training.
+        """
+        if k < 0 or not self.training:
+            return edge_index, edge_attr
+
+        num_edges = edge_index.size(1)
+        dest_nodes = edge_index[1]
+
+        if edge_attr is not None:
+            # Group by destination node AND relation type for relation-specific sampling
+            sort_key = dest_nodes * self.hparams.num_relations + edge_attr
+        else:
+            # Group only by destination node if no edge types are available
+            sort_key = dest_nodes
+
+        # Generate a random permutation of all edges to shuffle them
+        perm = torch.randperm(num_edges, device=edge_index.device)
+
+        # Sort the permuted edges by their group key. This results in edges
+        # being grouped together, and within each group, they are randomly ordered.
+        # `stable=True` is crucial here to preserve the random order from the first sort.
+        sorted_perm_by_key = torch.argsort(sort_key[perm], stable=True)
+        perm_sorted = perm[sorted_perm_by_key]
+
+        # Apply the permutation to get the grouped, shuffled edges and their keys
+        edge_index_perm = edge_index[:, perm_sorted]
+        edge_attr_perm = edge_attr[perm_sorted] if edge_attr is not None else None
+        sort_key_perm = sort_key[perm_sorted]
+
+        # Find group boundaries and select the first `k` from each shuffled group
+        _ , group_counts = torch.unique_consecutive(sort_key_perm, return_counts=True)
+        group_starts = torch.cat([torch.tensor([0], device=edge_index.device), torch.cumsum(group_counts, 0)[:-1]])
+        
+        # Create an index for each edge within its group (0, 1, 2, ..., 0, 1, ...)
+        intra_group_idx = torch.arange(num_edges, device=edge_index.device) - group_starts.repeat_interleave(group_counts)
+
+        # Create a mask to keep only the first `k` edges in each group
+        mask = intra_group_idx < k
+        
+        # Select the edges using the mask
+        sampled_edge_index = edge_index_perm[:, mask]
+        sampled_edge_attr = edge_attr_perm[mask] if edge_attr is not None else None
+
+        return sampled_edge_index, sampled_edge_attr
+
     def _apply_edge_dropout(self, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
         if not self.training or self.edge_dropout_p == 0.0:
             return edge_index, edge_attr
@@ -198,7 +252,7 @@ class GNNRetriever(pl.LightningModule):
     def _gnn_forward_pass(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         """
         Apply GNN layers with optional initial projection, residual connections, 
-        normalization, activation and dropout.
+        normalization, activation and dropout. Also handles neighbor sampling.
         """
         target_dtype = next(self.parameters()).dtype
         x = x.to(target_dtype)
@@ -208,14 +262,32 @@ class GNNRetriever(pl.LightningModule):
         if self.initial_projection is not None:
             x = self.initial_projection(x)
         
-        # Apply edge dropout once for all layers
-        dropped_edge_index, dropped_edge_attr = self._apply_edge_dropout(edge_index, edge_attr)
-        
         for i, layer in enumerate(self.layers):
+            # Determine which edges to use for this layer's message passing
+            # Check if neighbor sampling is configured and active for the current layer
+            use_neighbor_sampling = (
+                self.hparams.neighbor_sampling_sizes is not None and
+                self.training and
+                i < len(self.hparams.neighbor_sampling_sizes) and
+                self.hparams.neighbor_sampling_sizes[i] >= 0
+            )
+
+            if use_neighbor_sampling:
+                # If so, perform neighbor sampling
+                k = self.hparams.neighbor_sampling_sizes[i]
+                layer_edge_index, layer_edge_attr = self._sample_neighbors(
+                    edge_index, edge_attr, k
+                )
+            else:
+                # Otherwise, fall back to the original global edge dropout logic
+                layer_edge_index, layer_edge_attr = self._apply_edge_dropout(
+                    edge_index, edge_attr
+                )
+
             x_residual = x
             
-            # Use the refactored helper method with dropped edges
-            x = self._apply_gnn_layer(layer, x, dropped_edge_index, dropped_edge_attr)
+            # Use the refactored helper method with the selected edges
+            x = self._apply_gnn_layer(layer, x, layer_edge_index, layer_edge_attr)
             
             if self.norm_layers is not None and i < len(self.norm_layers):
                 x = self.norm_layers[i](x)
