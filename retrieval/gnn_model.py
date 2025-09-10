@@ -44,6 +44,7 @@ class GNNRetriever(pl.LightningModule):
         edge_type_to_id: Dict[str, int],
         lr : float,
         warmup_steps : int,
+        loss_function: str = "mse",
         l1_lambda: float = 0.0,
         weight_decay: float = 0.0,
         gnn_layer_type: str = "rgcn",
@@ -62,6 +63,8 @@ class GNNRetriever(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        assert self.hparams.loss_function in ["mse", "cross_entropy"], \
+           f"loss_function must be 'mse' or 'cross_entropy', but got {self.hparams.loss_function}"
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
         
         self.feature_size = feature_size
@@ -307,16 +310,62 @@ class GNNRetriever(pl.LightningModule):
             
         return augmented_features, augmented_edge_index, augmented_edge_attr
 
-    def _extract_and_normalize_embeddings(
+    def _get_final_embeddings(
         self, 
-        x: torch.FloatTensor, 
-        num_premises: int
+        x: torch.FloatTensor,
+        node_features: torch.FloatTensor,
+        context_features: torch.FloatTensor,
+        normalize: bool,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
-        Extract premise and context embeddings from combined tensor and normalize them.
+        Computes the final premise and context embeddings after GNN pass and post-processing.
+        Can optionally normalize embeddings at each step, which is required for MSE loss (cosine similarity).
+        For cross-entropy loss, embeddings are not normalized to serve as logits.
         """
-        final_premise_embs = F.normalize(x[:num_premises], p=2, dim=1)
-        final_context_embs = F.normalize(x[num_premises:], p=2, dim=1)
+        num_premises = node_features.shape[0]
+        gnn_premise_embs = x[:num_premises]
+        gnn_context_embs = x[num_premises:]
+
+        if self.hparams.postprocess_gnn_embeddings == "gnn":
+            final_premise_embs = gnn_premise_embs
+            final_context_embs = gnn_context_embs
+        else:
+            # Both 'concat' and 'gating' need the original embeddings
+            original_premise_embs = node_features.to(gnn_premise_embs.device)
+            original_context_embs = context_features.to(gnn_context_embs.device)
+
+            # Stochastic LM masking during training
+            if self.training and (self.lm_mask_p is not None) and (self.lm_mask_p > 0.0):
+                if torch.rand(1, device=gnn_premise_embs.device).item() < float(self.lm_mask_p):
+                    original_premise_embs = torch.zeros_like(original_premise_embs)
+                    original_context_embs = torch.zeros_like(original_context_embs)
+
+            # If normalizing, each component is normalized before fusion.
+            if normalize:
+                gnn_premise_embs = F.normalize(gnn_premise_embs, p=2, dim=1)
+                gnn_context_embs = F.normalize(gnn_context_embs, p=2, dim=1)
+                original_premise_embs = F.normalize(original_premise_embs, p=2, dim=1)
+                original_context_embs = F.normalize(original_context_embs, p=2, dim=1)
+
+            if self.hparams.postprocess_gnn_embeddings == "concat":
+                final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
+                final_context_embs = torch.cat([gnn_context_embs, original_context_embs], dim=1)
+            elif self.hparams.postprocess_gnn_embeddings == "gating":
+                # Fuse premise embeddings
+                gate_premise = torch.sigmoid(self.gating_layer(torch.cat([gnn_premise_embs, original_premise_embs], dim=1)))
+                final_premise_embs = gnn_premise_embs + gate_premise * original_premise_embs
+
+                # Fuse context embeddings
+                gate_context = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_context_embs], dim=1)))
+                final_context_embs = gnn_context_embs + gate_context * original_context_embs
+            else:
+                 raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
+
+        # The final result is normalized only if requested.
+        if normalize:
+            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
+            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+            
         return final_premise_embs, final_context_embs
 
     @torch.no_grad()
@@ -347,53 +396,33 @@ class GNNRetriever(pl.LightningModule):
         label: torch.FloatTensor,
         edge_attr: Optional[torch.LongTensor] = None,
     ) -> torch.FloatTensor:
-        num_premises = node_features.shape[0]
-
         # This now calls the new, vectorized implementation
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
             
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
-        gnn_premise_embs, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
 
-        if self.hparams.postprocess_gnn_embeddings == "gnn":
-            final_premise_embs = gnn_premise_embs
-            final_context_embs = gnn_context_embs
-        else:
-            # Both 'concat' and 'gating' need the original embeddings
-            original_premise_embs = F.normalize(node_features.to(gnn_premise_embs.device), p=2, dim=1)
-            original_context_embs = F.normalize(context_features.to(gnn_context_embs.device), p=2, dim=1)
-
-            # Stochastic LM masking during training
-            if self.training and (self.lm_mask_p is not None) and (self.lm_mask_p > 0.0):
-                if torch.rand(1, device=gnn_premise_embs.device).item() < float(self.lm_mask_p):
-                    original_premise_embs = torch.zeros_like(original_premise_embs)
-                    original_context_embs = torch.zeros_like(original_context_embs)
-            
-            if self.hparams.postprocess_gnn_embeddings == "concat":
-                final_premise_embs = F.normalize(torch.cat([gnn_premise_embs, original_premise_embs], dim=1), p=2, dim=1)
-                final_context_embs = F.normalize(torch.cat([gnn_context_embs, original_context_embs], dim=1), p=2, dim=1)
-            elif self.hparams.postprocess_gnn_embeddings == "gating":
-                # Fuse premise embeddings
-                gate_premise = torch.sigmoid(self.gating_layer(torch.cat([gnn_premise_embs, original_premise_embs], dim=1)))
-                fused_premise_embs = gnn_premise_embs + gate_premise * original_premise_embs
-                final_premise_embs = F.normalize(fused_premise_embs, p=2, dim=1)
-
-                # Fuse context embeddings
-                gate_context = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_context_embs], dim=1)))
-                fused_context_embs = gnn_context_embs + gate_context * original_context_embs
-                final_context_embs = F.normalize(fused_context_embs, p=2, dim=1)
-            else:
-                 raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
+        normalize_for_mse = self.hparams.loss_function == "mse"
+        final_premise_embs, final_context_embs = self._get_final_embeddings(
+            x, node_features, context_features, normalize=normalize_for_mse
+        )
 
         pos_premise_emb = final_premise_embs[pos_premise_indices]
         neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
         all_premise_embs = torch.cat([pos_premise_emb] + neg_premise_embs_flat, dim=0)
 
-        similarity = torch.mm(final_context_embs, all_premise_embs.t())
-        assert -1.001 <= similarity.min() <= similarity.max() <= 1.001, f"Got {similarity.min()} and {similarity.max()}"
-        loss = F.mse_loss(similarity, label)
+        scores = torch.mm(final_context_embs, all_premise_embs.t())
+
+        if self.hparams.loss_function == "mse":
+            assert -1.001 <= scores.min() <= scores.max() <= 1.001, f"Got {scores.min()} and {scores.max()}"
+            loss = F.mse_loss(scores, label)
+        elif self.hparams.loss_function == "cross_entropy":
+            loss = F.binary_cross_entropy_with_logits(scores, label)
+        else:
+            # This path should not be reached due to the check in __init__
+            raise ValueError(f"Unknown loss function: {self.hparams.loss_function}")
+
         return loss
 
     def on_train_epoch_start(self) -> None:
@@ -444,35 +473,23 @@ class GNNRetriever(pl.LightningModule):
         initial_context_emb = batch["context_features"][0]
         logger.info(f"  Initial Context Embedding (first 8 values): {initial_context_emb[:8].cpu().numpy()}")
 
-        num_premises = batch["node_features"].shape[0]
         aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
             batch["node_features"], batch["context_features"][[0]], batch["edge_index"],
             batch.get("edge_attr"), [batch["lctx_neighbor_indices"][0]], [batch["goal_neighbor_indices"][0]],
         )
         x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
-        _, gnn_context_embs = self._extract_and_normalize_embeddings(x, num_premises)
-
-        postprocess_option = self.hparams.postprocess_gnn_embeddings
-        if postprocess_option == "gnn":
-            final_context_emb = gnn_context_embs
-        else:
-            # Both 'concat' and 'gating' need the original embeddings
-            original_context_emb = F.normalize(initial_context_emb.unsqueeze(0).to(gnn_context_embs.device), p=2, dim=1)
-            
-            if postprocess_option == "concat":
-                concatenated_emb = torch.cat([gnn_context_embs, original_context_emb], dim=1)
-                final_context_emb = F.normalize(concatenated_emb, p=2, dim=1)
-            elif postprocess_option == "gating":
-                gate = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_context_emb], dim=1)))
-                fused_emb = gnn_context_embs + gate * original_context_emb
-                final_context_emb = F.normalize(fused_emb, p=2, dim=1)
-            else:
-                # Fallback to just GNN embeddings if option is unknown
-                final_context_emb = gnn_context_embs
-
+        
+        # Log the final embedding as it is used in loss calculation
+        normalize = self.hparams.loss_function == "mse"
+        _, final_context_emb = self._get_final_embeddings(
+            x,
+            batch["node_features"],
+            batch["context_features"][[0]],
+            normalize=normalize
+        )
         final_context_emb_vec = final_context_emb.squeeze(0)
 
-        logger.info(f"  Final GNN Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}")
+        logger.info(f"  Final ({'Normalized' if normalize else 'Unnormalized'}) Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}")
         logger.info("--- End of Training Sample Log ---")
         self.train()
 
@@ -483,16 +500,16 @@ class GNNRetriever(pl.LightningModule):
             if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
                 self._log_training_sample(batch, batch_idx)
 
-        mse_loss = self(
+        loss = self(
             batch["node_features"], batch["edge_index"], batch["context_features"],
             batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
             batch["pos_premise_indices"], batch["neg_premises_indices"],
             batch["label"], batch.get("edge_attr", None),
         )
-        self.log("mse_loss_train", mse_loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
+        self.log("loss_train_unregularized", loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
 
         # --- L1 REGULARIZATION ---
-        total_loss = mse_loss
+        total_loss = loss
         if self.hparams.l1_lambda > 0:
             l1_penalty = 0.0
             # We regularize the weights of GNN layers and projection layers.
@@ -513,7 +530,7 @@ class GNNRetriever(pl.LightningModule):
             
             l1_loss = self.hparams.l1_lambda * l1_penalty
             self.log("l1_loss_train", l1_loss, on_step=True, on_epoch=True, sync_dist=True)
-            total_loss = mse_loss + l1_loss
+            total_loss = loss + l1_loss
         # --- END L1 REGULARIZATION ---
         
         self.log("loss_train", total_loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
