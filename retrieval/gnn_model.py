@@ -55,7 +55,8 @@ class GNNRetriever(pl.LightningModule):
         use_residual: bool = True,
         dropout_p: float = 0.5,
         edge_dropout_p: float = 0.1,
-        lm_mask_p: float = 0.5,
+        mask_regime_probs: Optional[Dict[str, float]] = None,
+        full_drop_prob: float = 0.5,
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         postprocess_gnn_embeddings: str = "gnn",
@@ -63,10 +64,24 @@ class GNNRetriever(pl.LightningModule):
         neighbor_sampling_sizes: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
+        # Avoid mutable default argument
+        if mask_regime_probs is None:
+            mask_regime_probs = {"no_drop": 0.1, "drop_concat": 0.2, "full_drop": 0.7}
+
         self.save_hyperparameters()
         assert self.hparams.loss_function in ["mse", "cross_entropy"], \
            f"loss_function must be 'mse' or 'cross_entropy', but got {self.hparams.loss_function}"
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
+
+        # Validate and normalize mask_regime_probs
+        expected_keys = {"no_drop", "drop_concat", "full_drop"}
+        assert expected_keys == set(mask_regime_probs.keys()), f"mask_regime_probs must contain keys: {expected_keys}"
+        assert all(p >= 0 for p in mask_regime_probs.values()), "Probabilities in mask_regime_probs must be non-negative."
+        prob_sum = sum(mask_regime_probs.values())
+        assert prob_sum > 1e-6, "Sum of probabilities in mask_regime_probs must be positive."
+        
+        self.regimes = list(mask_regime_probs.keys())
+        self.regime_probs = [p / prob_sum for p in mask_regime_probs.values()]
         
         self.feature_size = feature_size
         self.hidden_size = hidden_size if hidden_size is not None else feature_size
@@ -79,7 +94,6 @@ class GNNRetriever(pl.LightningModule):
         self.use_residual = use_residual
         self.dropout_p = dropout_p
         self.edge_dropout_p = edge_dropout_p
-        self.lm_mask_p = lm_mask_p
         self.norm_type = norm_type.lower() if norm_type else "none"
         self.use_initial_projection = use_initial_projection
         self.edge_type_to_id = edge_type_to_id
@@ -168,6 +182,17 @@ class GNNRetriever(pl.LightningModule):
                 self.norm_layers.append(create_norm_layer(self.norm_type, self.hidden_size))
                 
             input_size = self.hidden_size
+
+    def _sample_mask_regime(self) -> str:
+        """Samples a mask regime using torch.multinomial for reproducibility."""
+        if not self.training:
+            return "no_drop"
+        
+        device = next(self.parameters()).device
+        probs_tensor = torch.tensor(self.regime_probs, device=device)
+        sampled_idx = torch.multinomial(probs_tensor, num_samples=1).item()
+        
+        return self.regimes[sampled_idx]
 
     def _sample_neighbors(
         self,
@@ -383,11 +408,13 @@ class GNNRetriever(pl.LightningModule):
         return augmented_features, augmented_edge_index, augmented_edge_attr
 
     def _get_final_embeddings(
-        self, 
+        self,
         x: torch.FloatTensor,
         node_features: torch.FloatTensor,
         context_features: torch.FloatTensor,
         normalize: bool,
+        regime: str,
+        input_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
         Computes the final premise and context embeddings after GNN pass and post-processing.
@@ -406,18 +433,23 @@ class GNNRetriever(pl.LightningModule):
             original_premise_embs = node_features.to(gnn_premise_embs.device)
             original_context_embs = context_features.to(gnn_context_embs.device)
 
-            # Stochastic LM masking during training
-            if self.training and (self.lm_mask_p is not None) and (self.lm_mask_p > 0.0):
-                if torch.rand(1, device=gnn_premise_embs.device).item() < float(self.lm_mask_p):
-                    original_premise_embs = torch.zeros_like(original_premise_embs)
-                    original_context_embs = torch.zeros_like(original_context_embs)
+            # Apply masking based on the sampled regime for this training step.
+            if self.training and regime == "drop_concat":
+                original_premise_embs = torch.zeros_like(original_premise_embs)
+                original_context_embs = torch.zeros_like(original_context_embs)
+            elif self.training and regime == "full_drop":
+                assert input_mask is not None, "An input_mask must be provided for the 'full_drop' regime."
+                premise_mask = input_mask[:num_premises]
+                context_mask = input_mask[num_premises:]
+                original_premise_embs = original_premise_embs * premise_mask
+                original_context_embs = original_context_embs * context_mask
 
             # If normalizing, each component is normalized before fusion.
             if normalize:
-                gnn_premise_embs = F.normalize(gnn_premise_embs, p=2, dim=1)
-                gnn_context_embs = F.normalize(gnn_context_embs, p=2, dim=1)
-                original_premise_embs = F.normalize(original_premise_embs, p=2, dim=1)
-                original_context_embs = F.normalize(original_context_embs, p=2, dim=1)
+                gnn_premise_embs = F.normalize(gnn_premise_embs, p=2, dim=1, eps=1e-12)
+                gnn_context_embs = F.normalize(gnn_context_embs, p=2, dim=1, eps=1e-12)
+                original_premise_embs = F.normalize(original_premise_embs, p=2, dim=1, eps=1e-12)
+                original_context_embs = F.normalize(original_context_embs, p=2, dim=1, eps=1e-12)
 
             if self.hparams.postprocess_gnn_embeddings == "concat":
                 final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
@@ -435,8 +467,8 @@ class GNNRetriever(pl.LightningModule):
 
         # The final result is normalized only if requested.
         if normalize:
-            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1)
-            final_context_embs = F.normalize(final_context_embs, p=2, dim=1)
+            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1, eps=1e-12)
+            final_context_embs = F.normalize(final_context_embs, p=2, dim=1, eps=1e-12)
             
         return final_premise_embs, final_context_embs
 
@@ -468,16 +500,27 @@ class GNNRetriever(pl.LightningModule):
         label: torch.FloatTensor,
         edge_attr: Optional[torch.LongTensor] = None,
     ) -> torch.FloatTensor:
+        # Sample a mask regime for this forward pass.
+        regime = self._sample_mask_regime()
+
         # This now calls the new, vectorized implementation
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
             
+        input_mask = None
+        if self.training and regime == "full_drop":
+            drop_prob = self.hparams.full_drop_prob
+            # Create a per-node mask (1s for keep, 0s for drop) broadcastable across features.
+            input_mask = (torch.rand(augmented_features.shape[0], 1, device=augmented_features.device) > drop_prob).to(augmented_features.dtype)
+            # Apply mask to the initial features before the GNN pass.
+            augmented_features = augmented_features * input_mask
+            
         x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
 
         normalize_for_mse = self.hparams.loss_function == "mse"
         final_premise_embs, final_context_embs = self._get_final_embeddings(
-            x, node_features, context_features, normalize=normalize_for_mse
+            x, node_features, context_features, normalize=normalize_for_mse, regime=regime, input_mask=input_mask
         )
 
         pos_premise_emb = final_premise_embs[pos_premise_indices]
@@ -557,7 +600,8 @@ class GNNRetriever(pl.LightningModule):
             x,
             batch["node_features"],
             batch["context_features"][[0]],
-            normalize=normalize
+            normalize=normalize,
+            regime="no_drop" # Use no_drop for logging consistency
         )
         final_context_emb_vec = final_context_emb.squeeze(0)
 
@@ -734,18 +778,18 @@ class GNNRetriever(pl.LightningModule):
             context_embs = self.final_projection(context_embs)
 
         if self.hparams.postprocess_gnn_embeddings == "gnn":
-            final_embs = F.normalize(context_embs, p=2, dim=1)
+            final_embs = F.normalize(context_embs, p=2, dim=1, eps=1e-12)
         else:
             # Both 'concat' and 'gating' need the original embeddings
-            orig_embs_norm = F.normalize(initial_context_embs, p=2, dim=1)
-            gnn_embs_norm = F.normalize(context_embs, p=2, dim=1)
+            orig_embs_norm = F.normalize(initial_context_embs, p=2, dim=1, eps=1e-12)
+            gnn_embs_norm = F.normalize(context_embs, p=2, dim=1, eps=1e-12)
 
             if self.hparams.postprocess_gnn_embeddings == "concat":
-                final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1)
+                final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1, eps=1e-12)
             elif self.hparams.postprocess_gnn_embeddings == "gating":
                 gate = torch.sigmoid(self.gating_layer(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1)))
                 fused_embs = gnn_embs_norm + gate * orig_embs_norm
-                final_embs = F.normalize(fused_embs, p=2, dim=1)
+                final_embs = F.normalize(fused_embs, p=2, dim=1, eps=1e-12)
             else:
                 raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
             
