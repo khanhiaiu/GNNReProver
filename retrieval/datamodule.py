@@ -39,7 +39,8 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
-        graph_dependencies_config: Optional[Dict[str, Any]]
+        graph_dependencies_config: Optional[Dict[str, Any]],
+        negative_mining_strategy: str = "random",
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -49,6 +50,7 @@ class RetrievalDataset(Dataset):
         self.tokenizer = tokenizer
         self.is_train = is_train
         self.graph_dependencies_config = graph_dependencies_config
+        self.negative_mining_strategy = negative_mining_strategy
         self.data = list(
             itertools.chain.from_iterable(self._load_data(path) for path in data_paths)
         )
@@ -115,38 +117,50 @@ class RetrievalDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Example:
-        if not self.is_train:
-            return self.data[idx]
-
-        # In-file negatives + random negatives from all accessible premises.
         ex = deepcopy(self.data[idx])
-        premises_in_file = []
-        premises_outside_file = []
 
-        for p in self.corpus.get_premises(ex["context"].path):
-            if p == ex["pos_premise"]:
-                continue
-            if p.end < ex["context"].theorem_pos:
-                if ex["pos_premise"].path == ex["context"].path:
-                    premises_in_file.append(p)
+        if not self.is_train:
+            return ex
+
+        if self.negative_mining_strategy == "random":
+            # In-file negatives + random negatives from all accessible premises.
+            premises_in_file = []
+            premises_outside_file = []
+
+            for p in self.corpus.get_premises(ex["context"].path):
+                if p == ex["pos_premise"]:
+                    continue
+                if p.end < ex["context"].theorem_pos:
+                    if ex["pos_premise"].path == ex["context"].path:
+                        premises_in_file.append(p)
+                    else:
+                        premises_outside_file.append(p)
+
+            for p in self.corpus.transitive_dep_graph.successors(ex["context"].path):
+                if p == ex["pos_premise"].path:
+                    premises_in_file += [
+                        _p
+                        for _p in self.corpus.get_premises(p)
+                        if _p != ex["pos_premise"]
+                    ]
                 else:
-                    premises_outside_file.append(p)
+                    premises_outside_file += self.corpus.get_premises(p)
 
-        for p in self.corpus.transitive_dep_graph.successors(ex["context"].path):
-            if p == ex["pos_premise"].path:
-                premises_in_file += [
-                    _p for _p in self.corpus.get_premises(p) if _p != ex["pos_premise"]
-                ]
-            else:
-                premises_outside_file += self.corpus.get_premises(p)
+            num_in_file_negatives = min(
+                len(premises_in_file), self.num_in_file_negatives
+            )
 
-        num_in_file_negatives = min(len(premises_in_file), self.num_in_file_negatives)
+            ex["neg_premises"] = random.sample(
+                premises_in_file, num_in_file_negatives
+            ) + random.sample(
+                premises_outside_file, self.num_negatives - num_in_file_negatives
+            )
+        elif self.negative_mining_strategy == "hard":
+            # For hard negative mining, we only need to identify accessible in-file premises.
+            ex["accessible_in_file_premises"] = [
+                p for p in self.corpus.get_accessible_premises(ex["context"].path, ex["context"].theorem_pos) if p.path == ex["context"].path
+            ]
 
-        ex["neg_premises"] = random.sample(
-            premises_in_file, num_in_file_negatives
-        ) + random.sample(
-            premises_outside_file, self.num_negatives - num_in_file_negatives
-        )
         return ex
 
     def collate(self, examples: List[Example]) -> Batch:
@@ -227,20 +241,29 @@ class RetrievalDataModule(pl.LightningDataModule):
         self,
         data_path: str,
         corpus_path: Optional[str],
-        num_negatives: int,
-        num_in_file_negatives: int,
         model_name: str,
         batch_size: int,
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
         graph_dependencies_config: Dict[str, Any],
+        negative_mining: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.data_path = data_path
-        self.num_negatives = num_negatives
-        assert 0 <= num_in_file_negatives <= num_negatives
-        self.num_in_file_negatives = num_in_file_negatives
+
+        if negative_mining is None:
+            # Provide default values if the section is missing
+            self.negative_mining_strategy = "random"
+            self.num_negatives = 3
+            self.num_in_file_negatives = 1
+        else:
+            self.negative_mining_strategy = negative_mining.get("strategy", "random")
+            self.num_negatives = negative_mining.get("num_negatives", 3)
+            self.num_in_file_negatives = negative_mining.get("num_in_file_negatives", 1)
+        
+        assert 0 <= self.num_in_file_negatives <= self.num_negatives
+
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.max_seq_len = max_seq_len
@@ -250,16 +273,12 @@ class RetrievalDataModule(pl.LightningDataModule):
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        # vvvvvv MODIFIED SECTION vvvvvv
-        # REASONING: This allows the Corpus to be built with GNN-specific parameters
-        # during prediction, ensuring consistency with training.
         if corpus_path is not None:
             if graph_dependencies_config is None:
                 raise ValueError("graph_dependencies_config must be provided when corpus_path is specified.")
             self.corpus = Corpus(corpus_path, graph_dependencies_config)
         else:
             self.corpus = None
-        # ^^^^^^ END MODIFIED SECTION ^^^^^^
 
         metadata = json.load(open(os.path.join(data_path, "../metadata.json")))
         repo = LeanGitRepo(**metadata["from_repo"])
@@ -279,7 +298,8 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
-            graph_dependencies_config=self.graph_dependencies_config
+            graph_dependencies_config=self.graph_dependencies_config,
+            negative_mining_strategy=self.negative_mining_strategy,
         )
 
         if stage in (None, "fit", "validate"):
@@ -291,7 +311,8 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                graph_dependencies_config=self.graph_dependencies_config
+                graph_dependencies_config=self.graph_dependencies_config,
+                negative_mining_strategy=self.negative_mining_strategy,
             )
 
         if stage in (None, "fit", "predict"):
@@ -306,7 +327,8 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
-                graph_dependencies_config=self.graph_dependencies_config
+                graph_dependencies_config=self.graph_dependencies_config,
+                negative_mining_strategy=self.negative_mining_strategy,
             )
 
     def train_dataloader(self) -> DataLoader:

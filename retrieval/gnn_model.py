@@ -34,8 +34,6 @@ from retrieval.gnn_utils import (
 
 
 class GNNRetriever(pl.LightningModule):
-# In retrieval/gnn_model.py
-
     def __init__(
         self,
         feature_size: int,
@@ -60,6 +58,7 @@ class GNNRetriever(pl.LightningModule):
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         postprocess_gnn_embeddings: str = "gnn",
+        negative_mining: Optional[Dict[str, Any]] = None, # CORRECTED: Added Optional and default=None
         num_logs_per_epoch: int = 5,
         neighbor_sampling_sizes: Optional[List[int]] = None,
     ) -> None:
@@ -67,6 +66,14 @@ class GNNRetriever(pl.LightningModule):
         # Avoid mutable default argument
         if mask_regime_probs is None:
             mask_regime_probs = {"no_drop": 0.1, "drop_concat": 0.2, "full_drop": 0.7}
+
+        # CORRECTED: Handle the default case for negative_mining
+        if negative_mining is None:
+            negative_mining = {
+                "strategy": "random",
+                "num_negatives": 3,
+                "num_in_file_negatives": 1
+            }
 
         self.save_hyperparameters()
         assert self.hparams.loss_function in ["mse", "cross_entropy"], \
@@ -183,17 +190,6 @@ class GNNRetriever(pl.LightningModule):
                 
             input_size = self.hidden_size
 
-    def _sample_mask_regime(self) -> str:
-        """Samples a mask regime using torch.multinomial for reproducibility."""
-        if not self.training:
-            return "no_drop"
-        
-        device = next(self.parameters()).device
-        probs_tensor = torch.tensor(self.regime_probs, device=device)
-        sampled_idx = torch.multinomial(probs_tensor, num_samples=1).item()
-        
-        return self.regimes[sampled_idx]
-
     def _sample_neighbors(
         self,
         edge_index: torch.LongTensor,
@@ -254,6 +250,8 @@ class GNNRetriever(pl.LightningModule):
         num_edges = edge_index.size(1)
         keep_prob = 1.0 - self.edge_dropout_p
         edge_mask = torch.rand(num_edges, device=edge_index.device) < keep_prob
+
+        assert edge_index.shape[0] == 2, "edge_index should have shape [2, num_edges]"
         
         dropped_edge_index = edge_index[:, edge_mask]
         dropped_edge_attr = edge_attr[edge_mask] if edge_attr is not None else None
@@ -369,8 +367,10 @@ class GNNRetriever(pl.LightningModule):
         
         def process_neighbors(neighbor_indices_list, edge_name_key):
             edge_name = _get_edge_type_name_from_tag(edge_name_key, self.graph_dependencies_config)
-            if not edge_name or edge_name not in self.edge_type_to_id:
+            if not edge_name:
                 return
+            if edge_name not in self.edge_type_to_id:
+                raise ValueError(f"Edge type '{edge_name}' not found in edge_type_to_id mapping {self.edge_type_to_id}.")
 
             edge_type_id = self.edge_type_to_id[edge_name]
             
@@ -468,18 +468,6 @@ class GNNRetriever(pl.LightningModule):
             
         return final_premise_embs, final_context_embs
 
-    @torch.no_grad()
-    def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
-        """
-        Public method to apply GNN layers to embeddings. Used for external inference.
-        """
-        was_training = self.training
-        self.eval()
-        try:
-            return self._gnn_forward_pass(x, edge_index, edge_attr)
-        finally:
-            self.train(was_training)
-
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "GNNRetriever":
         return load_checkpoint(cls, ckpt_path, device, freeze)
@@ -496,6 +484,10 @@ class GNNRetriever(pl.LightningModule):
         label: torch.FloatTensor,
         edge_attr: Optional[torch.LongTensor] = None,
     ) -> torch.FloatTensor:
+        """
+        This method contains the logic for training with pre-sampled, in-batch random negatives.
+        It is called by `training_step` when `negative_mining.strategy` is 'random'.
+        """
         augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
             node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
         )
@@ -524,7 +516,7 @@ class GNNRetriever(pl.LightningModule):
                 drop_prob = self.hparams.full_drop_prob
                 
                 # Generate a per-node mask (broadcast across features) only for the contexts that need it.
-                random_mask = (torch.rand(num_to_drop, 1, device=self.device) > drop_prob).to(augmented_features.dtype)
+                random_mask = (torch.rand(num_to_drop, 1, device=self.device) > drop_prob).to(augmented_features.dtype) # TODO this has to change
                 context_mask[full_drop_mask] = random_mask
                 
                 # Apply the mask to the context part of the features.
@@ -625,19 +617,111 @@ class GNNRetriever(pl.LightningModule):
         logger.info("--- End of Training Sample Log ---")
         self.train()
 
-# In retrieval/gnn_model.py
+    @torch.no_grad()
+    def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
+        """
+        Public method to apply GNN layers to embeddings. Used for external inference.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            return self._gnn_forward_pass(x, edge_index, edge_attr)
+        finally:
+            self.train(was_training)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+        if self.hparams.negative_mining['strategy'] == 'hard':
+            # --- ONLINE HARD NEGATIVE MINING ---
+            # 1. Get GNN-refined embeddings for contexts and all premises.
+            augmented_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
+                batch["node_features"], batch["context_features"], batch["edge_index"],
+                batch.get("edge_attr"), batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
+            )
+            x = self._gnn_forward_pass(augmented_features, aug_edge_index, aug_edge_attr)
+
+            normalize = self.hparams.loss_function == "mse"
+            regimes = ["no_drop"] * batch["context_features"].shape[0] # Use 'no_drop' for mining
+            final_premise_embs, final_context_embs = self._get_final_embeddings(
+                x, batch["node_features"], batch["context_features"], normalize=normalize, regimes=regimes
+            )
+
+            # 2. Compute scores between all contexts and all premises.
+            all_scores = torch.mm(final_context_embs, final_premise_embs.t())
+
+            # 3. Mask out positive premises to avoid selecting them as negatives.
+            batch_size, num_premises = all_scores.shape
+            pos_mask = torch.zeros_like(all_scores, dtype=torch.bool)
+            for i in range(batch_size):
+                pos_indices = batch['all_pos_premise_indices'][i]
+                if pos_indices.numel() > 0:
+                    pos_mask[i, pos_indices] = True
+            all_scores.masked_fill_(pos_mask, -torch.inf)
+
+            # 4. Mine hard negatives (in-file and global).
+            num_neg = self.hparams.negative_mining['num_negatives']
+            num_in_file_neg = self.hparams.negative_mining['num_in_file_negatives']
+            
+            hard_neg_indices_parts = []
+
+            # In-file hard negatives
+            if num_in_file_neg > 0:
+                in_file_scores = torch.full_like(all_scores, -torch.inf)
+                in_file_mask = torch.zeros_like(all_scores, dtype=torch.bool)
+                for i in range(batch_size):
+                    in_file_indices = batch['accessible_in_file_indices'][i]
+                    if in_file_indices.numel() > 0:
+                        in_file_scores[i, in_file_indices] = all_scores[i, in_file_indices]
+                        in_file_mask[i, in_file_indices] = True
+                
+                _, in_file_negs = torch.topk(in_file_scores, k=num_in_file_neg, dim=1)
+                hard_neg_indices_parts.append(in_file_negs)
+                all_scores.masked_fill_(in_file_mask, -torch.inf) # Mask from global selection
+
+            # Global hard negatives
+            num_global_neg = num_neg - num_in_file_neg
+            if num_global_neg > 0:
+                _, global_negs = torch.topk(all_scores, k=num_global_neg, dim=1)
+                hard_neg_indices_parts.append(global_negs)
+
+            hard_neg_indices = torch.cat(hard_neg_indices_parts, dim=1)
+
+            # 5. Construct tensors for loss calculation.
+            pos_indices = batch['pos_premise_indices'].unsqueeze(1)
+            all_indices = torch.cat([pos_indices, hard_neg_indices], dim=1) # [B, 1+N]
+
+            # This line uses direct indexing, which is faster
+            batch_embs = final_premise_embs[all_indices] # [B, 1+N, D]
+            context_embs_exp = final_context_embs.unsqueeze(1) # [B, 1, D]
+            scores = torch.bmm(context_embs_exp, batch_embs.transpose(1, 2)).squeeze(1)
+
+            # 6. Create label and compute loss.
+            new_label = torch.zeros_like(scores)
+            new_label[:, 0] = 1.0
+            # Check if any mined negatives were actually positives (shouldn't happen with masking).
+            for i in range(batch_size):
+                pos_set = set(batch['all_pos_premise_indices'][i].tolist())
+                for j in range(num_neg):
+                    if hard_neg_indices[i, j].item() in pos_set:
+                        new_label[i, 1 + j] = 1.0
+
+            if self.hparams.loss_function == "mse":
+                loss = F.mse_loss(scores, new_label)
+            else:
+                loss = F.binary_cross_entropy_with_logits(scores, new_label)
+
+        else:
+            # --- OFFLINE RANDOM NEGATIVE SAMPLING (Original Logic) ---
+            loss = self(
+                batch["node_features"], batch["edge_index"], batch["context_features"],
+                batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
+                batch["pos_premise_indices"], batch["neg_premises_indices"],
+                batch["label"], batch.get("edge_attr", None),
+            )
+
         if hasattr(self, "logging_steps") and batch_idx in self.logging_steps:
             if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
                 self._log_training_sample(batch, batch_idx)
 
-        loss = self(
-            batch["node_features"], batch["edge_index"], batch["context_features"],
-            batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
-            batch["pos_premise_indices"], batch["neg_premises_indices"],
-            batch["label"], batch.get("edge_attr", None),
-        )
         self.log("loss_train_unregularized", loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
 
         # --- L1 REGULARIZATION ---
@@ -653,7 +737,7 @@ class GNNRetriever(pl.LightningModule):
             if self.final_projection is not None:
                 modules_to_regularize.append(self.final_projection)
             if hasattr(self, 'gating_layer'):
-                 modules_to_regularize.append(self.gating_layer)
+                modules_to_regularize.append(self.gating_layer)
 
             for module in modules_to_regularize:
                 for name, param in module.named_parameters():

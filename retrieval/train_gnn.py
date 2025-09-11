@@ -20,6 +20,7 @@ from retrieval.gnn_datamodule import GNNDataModule
 class GNNCLI(LightningCLI):
     def add_arguments_to_parser(self, parser) -> None:
         parser.link_arguments("data.graph_dependencies_config", "model.graph_dependencies_config")
+        parser.link_arguments("data.negative_mining", "model.negative_mining")
         
     def before_instantiate_classes(self) -> None:
         from common import Corpus
