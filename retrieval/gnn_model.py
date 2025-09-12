@@ -309,6 +309,60 @@ class GNNRetriever(pl.LightningModule):
         logger.info(f"  Final ({'Normalized' if normalize else 'Unnormalized'}) Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}"); logger.info("--- End of Training Sample Log ---")
         self.train()
 
+    def _compute_retrieval_metrics(self, scores: torch.Tensor, pos_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Computes R@1, R@10, and MRR for a batch given scores and a positive mask.
+
+        Args:
+            scores (torch.Tensor): A tensor of shape (batch_size, num_premises) with similarity scores.
+            pos_mask (torch.Tensor): A boolean tensor of shape (batch_size, num_premises)
+                                     where True indicates a positive premise.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the mean R@1, R@10, and MRR for the batch.
+        """
+        # Get the ranked list of premise indices for each context in the batch
+        ranked_indices = torch.argsort(scores, dim=1, descending=True)
+
+        # Get the number of positive premises for each example, avoiding division by zero
+        num_positives = pos_mask.sum(dim=1).float()
+        valid_examples_mask = num_positives > 0
+        if not valid_examples_mask.any():
+            return {"R@1": torch.tensor(0.0), "R@10": torch.tensor(0.0), "MRR": torch.tensor(0.0)}
+
+        # --- Recall@k Calculation ---
+        # Check which of the top-k ranked premises are actually positive
+        top_10_indices = ranked_indices[:, :10]
+        top_10_hits = torch.gather(pos_mask, 1, top_10_indices)
+
+        # R@1
+        recall_at_1 = (top_10_hits[:, 0] / num_positives.clamp(min=1e-9)).mean()
+
+        # R@10
+        num_hits_at_10 = top_10_hits.sum(dim=1).float()
+        recall_at_10 = (num_hits_at_10 / num_positives.clamp(min=1e-9)).mean()
+        
+        # --- MRR Calculation ---
+        # Create a mask of hits across all ranked premises
+        ranked_hits = torch.gather(pos_mask, 1, ranked_indices)
+        
+        # Find the rank of the first hit for each example
+        # argmax returns the index of the first max value (first True)
+        first_hit_rank = torch.argmax(ranked_hits.int(), dim=1)
+        
+        # If no positive premise was found, argmax returns 0, which is wrong.
+        # We need to zero out the reciprocal rank for examples with no hits at all.
+        any_hits = ranked_hits.any(dim=1)
+        reciprocal_ranks = torch.where(
+            any_hits,
+            1.0 / (first_hit_rank.float() + 1),
+            torch.tensor(0.0, device=scores.device)
+        )
+        
+        mrr = reciprocal_ranks.mean()
+
+        return {"R@1": recall_at_1, "R@10": recall_at_10, "MRR": mrr}
+
     @torch.no_grad()
     def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         was_training = self.training; self.eval()
@@ -325,7 +379,6 @@ class GNNRetriever(pl.LightningModule):
             all_scores = torch.mm(final_context_embs, final_premise_embs.t())
             batch_size, num_premises = all_scores.shape
             
-            # --- FIX: Initialize pos_mask BEFORE it is used ---
             pos_mask = torch.zeros_like(all_scores, dtype=torch.bool)
             
             all_pos_indices_flat = [p for p in batch['all_pos_premise_indices'] if p.numel() > 0]
@@ -335,6 +388,12 @@ class GNNRetriever(pl.LightningModule):
                      torch.tensor([p.numel() for p in batch['all_pos_premise_indices']], device=all_scores.device)
                  )
                  pos_mask[batch_indices, all_pos_indices] = True
+            
+            # Compute and log retrieval metrics on the fly for the training batch
+            train_metrics = self._compute_retrieval_metrics(all_scores, pos_mask)
+            self.log("hard_mining/R@1_train", train_metrics["R@1"], on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            self.log("hard_mining/R@10_train", train_metrics["R@10"], on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            self.log("hard_mining/MRR_train", train_metrics["MRR"], on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
             
             all_scores.masked_fill_(pos_mask, -torch.inf)
             num_neg, num_in_file_neg = self.hparams.negative_mining['num_negatives'], self.hparams.negative_mining['num_in_file_negatives']
