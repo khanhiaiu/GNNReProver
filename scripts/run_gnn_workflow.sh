@@ -14,6 +14,9 @@ set -e
 source ~/.bashrc
 conda activate ReProver
 
+python -c "from torch_geometric.loader import NeighborSampler; import torch; edge_index=torch.tensor([[0,1],[1,0]]).t(); NeighborSampler(edge_index, sizes=[1], batch_size=1); print('NeighborSampler works!')"
+
+
 # --- 1. Argument Validation ---
 if [ "$#" -ne 4 ]; then
     echo "ERROR: Invalid number of arguments."

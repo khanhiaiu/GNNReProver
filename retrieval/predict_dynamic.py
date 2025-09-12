@@ -84,8 +84,8 @@ def main() -> None:
         num_workers=args.num_workers,
         max_seq_len=2048, 
         graph_dependencies_config=graph_dependencies_config,
-        num_negatives=0,  # Not needed for prediction
-        num_in_file_negatives=0,  # Not needed for prediction
+        #num_negatives=0,  # Not needed for prediction
+        #num_in_file_negatives=0,  # Not needed for prediction
     )
 
     # --- Step 3: Run prediction using the PyTorch Lightning Trainer ---

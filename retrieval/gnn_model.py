@@ -1,3 +1,5 @@
+# retrieval/gnn_model.py
+
 import torch
 from torch_geometric.data import Data
 
@@ -58,7 +60,7 @@ class GNNRetriever(pl.LightningModule):
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         postprocess_gnn_embeddings: str = "gnn",
-        negative_mining: Optional[Dict[str, Any]] = None, # CORRECTED: Added Optional and default=None
+        negative_mining: Optional[Dict[str, Any]] = None,
         num_logs_per_epoch: int = 5,
         neighbor_sampling_sizes: Optional[List[int]] = None,
     ) -> None:
@@ -67,7 +69,6 @@ class GNNRetriever(pl.LightningModule):
         if mask_regime_probs is None:
             mask_regime_probs = {"no_drop": 0.1, "drop_concat": 0.2, "full_drop": 0.7}
 
-        # CORRECTED: Handle the default case for negative_mining
         if negative_mining is None:
             negative_mining = {
                 "strategy": "random",
@@ -106,52 +107,40 @@ class GNNRetriever(pl.LightningModule):
         self.edge_type_to_id = edge_type_to_id
 
         if self.hparams.postprocess_gnn_embeddings == "gating":
-            # Gating layer input is the concatenation of GNN and original embeddings
             self.gating_layer = nn.Linear(self.feature_size * 2, self.feature_size)
 
-        # Initial projection layer (optional)
         if self.use_initial_projection:
             self.initial_projection = nn.Linear(feature_size, self.hidden_size)
         else:
             self.initial_projection = None
 
-        # Residual projection layer (if hidden_size != feature_size)
         if self.use_residual and self.hidden_size != feature_size:
             self.residual_projection = nn.Linear(feature_size, self.hidden_size)
         else:
             self.residual_projection = None
 
-        # Final projection layer (to get back to feature_size if needed)
         if self.hidden_size != feature_size:
             self.final_projection = nn.Linear(self.hidden_size, feature_size)
         else:
             self.final_projection = None
 
-        # Helper method to create normalization layers
         def create_norm_layer(norm_type: str, num_features: int) -> Optional[nn.Module]:
-            """Create normalization layer based on type."""
-            if norm_type == "batch":
-                return nn.BatchNorm1d(num_features)
-            elif norm_type == "layer":
-                return nn.LayerNorm(num_features)
-            elif norm_type == "instance":
-                return nn.InstanceNorm1d(num_features)
+            if norm_type == "batch": return nn.BatchNorm1d(num_features)
+            elif norm_type == "layer": return nn.LayerNorm(num_features)
+            elif norm_type == "instance": return nn.InstanceNorm1d(num_features)
             elif norm_type == "group":
                 num_groups = min(8, num_features)
                 while num_features % num_groups != 0 and num_groups > 1:
                     num_groups -= 1
                 return nn.GroupNorm(num_groups, num_features)
-            else:
-                return None
+            else: return None
 
-        # --- OPTIMIZATION 2: Refactor GNN Layer Initialization ---
-        # Define GNN layer configurations in a dictionary for cleaner code
         layer_configs = {
             "gcn": (GCNConv, {"out_channels": self.hidden_size}),
             "rgcn": (RGCNConv, {"out_channels": self.hidden_size, "num_relations": num_relations}),
             "gat": (GATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "concat": False}),
             "rgat": (RGATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "num_relations": num_relations, "concat": False}),
-            "gin": (GINConv, {}),  # GIN requires a special case for its MLP
+            "gin": (GINConv, {}),
             "graphsage": (SAGEConv, {"out_channels": self.hidden_size}),
         }
 
@@ -165,732 +154,322 @@ class GNNRetriever(pl.LightningModule):
         
         for i in range(num_layers):
             if self.gnn_layer_type == "gin":
-                mlp = nn.Sequential(
-                    nn.Linear(input_size, self.hidden_size * 2),
-                    nn.ReLU(),
-                    nn.Linear(self.hidden_size * 2, self.hidden_size)
-                )
+                mlp = nn.Sequential(nn.Linear(input_size, self.hidden_size * 2), nn.ReLU(), nn.Linear(self.hidden_size * 2, self.hidden_size))
                 layer = GINConv(mlp)
             else:
                 layer_class, kwargs = layer_configs[self.gnn_layer_type]
-                # Dynamically set the input channels for the current layer
                 current_kwargs = kwargs.copy()
-                # PyG layers use different names for input size, handle common ones
                 if "in_channels" in GCNConv.__init__.__code__.co_varnames:
                     current_kwargs["in_channels"] = input_size
-                else: # Fallback for older/different APIs
+                else:
                     current_kwargs["in_feats"] = input_size
-
                 layer = layer_class(**current_kwargs)
             
             self.layers.append(layer)
-
             if self.norm_type != "none":
                 self.norm_layers.append(create_norm_layer(self.norm_type, self.hidden_size))
-                
             input_size = self.hidden_size
 
-    def _sample_neighbors(
-        self,
-        edge_index: torch.LongTensor,
-        edge_attr: Optional[torch.LongTensor],
-        k: int,
-    ) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
-        """
-        Samples k incoming neighbors for each node, respecting relation types if available.
-        If k is negative, returns the original graph. This is only active during training.
-        """
-        if k < 0 or not self.training:
-            return edge_index, edge_attr
-
-        num_edges = edge_index.size(1)
-        dest_nodes = edge_index[1]
-
-        if edge_attr is not None:
-            # Group by destination node AND relation type for relation-specific sampling
-            sort_key = dest_nodes * self.hparams.num_relations + edge_attr
-        else:
-            # Group only by destination node if no edge types are available
-            sort_key = dest_nodes
-
-        # Generate a random permutation of all edges to shuffle them
+    def _sample_neighbors(self, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor], k: int) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
+        if k < 0 or not self.training: return edge_index, edge_attr
+        num_edges, dest_nodes = edge_index.size(1), edge_index[1]
+        sort_key = dest_nodes * self.hparams.num_relations + edge_attr if edge_attr is not None else dest_nodes
         perm = torch.randperm(num_edges, device=edge_index.device)
-
-        # Sort the permuted edges by their group key. This results in edges
-        # being grouped together, and within each group, they are randomly ordered.
-        # `stable=True` is crucial here to preserve the random order from the first sort.
         sorted_perm_by_key = torch.argsort(sort_key[perm], stable=True)
         perm_sorted = perm[sorted_perm_by_key]
-
-        # Apply the permutation to get the grouped, shuffled edges and their keys
-        edge_index_perm = edge_index[:, perm_sorted]
-        edge_attr_perm = edge_attr[perm_sorted] if edge_attr is not None else None
-        sort_key_perm = sort_key[perm_sorted]
-
-        # Find group boundaries and select the first `k` from each shuffled group
-        _ , group_counts = torch.unique_consecutive(sort_key_perm, return_counts=True)
+        edge_index_perm, edge_attr_perm, sort_key_perm = edge_index[:, perm_sorted], (edge_attr[perm_sorted] if edge_attr is not None else None), sort_key[perm_sorted]
+        _, group_counts = torch.unique_consecutive(sort_key_perm, return_counts=True)
         group_starts = torch.cat([torch.tensor([0], device=edge_index.device), torch.cumsum(group_counts, 0)[:-1]])
-        
-        # Create an index for each edge within its group (0, 1, 2, ..., 0, 1, ...)
         intra_group_idx = torch.arange(num_edges, device=edge_index.device) - group_starts.repeat_interleave(group_counts)
-
-        # Create a mask to keep only the first `k` edges in each group
         mask = intra_group_idx < k
-        
-        # Select the edges using the mask
-        sampled_edge_index = edge_index_perm[:, mask]
-        sampled_edge_attr = edge_attr_perm[mask] if edge_attr is not None else None
-
-        return sampled_edge_index, sampled_edge_attr
+        return edge_index_perm[:, mask], (edge_attr_perm[mask] if edge_attr is not None else None)
 
     def _apply_edge_dropout(self, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
-        if not self.training or self.edge_dropout_p == 0.0:
-            return edge_index, edge_attr
-        
-        num_edges = edge_index.size(1)
+        if not self.training or self.edge_dropout_p == 0.0: return edge_index, edge_attr
         keep_prob = 1.0 - self.edge_dropout_p
-        edge_mask = torch.rand(num_edges, device=edge_index.device) < keep_prob
+        edge_mask = torch.rand(edge_index.size(1), device=edge_index.device) < keep_prob
+        return edge_index[:, edge_mask], (edge_attr[edge_mask] if edge_attr is not None else None)
 
-        assert edge_index.shape[0] == 2, "edge_index should have shape [2, num_edges]"
-        
-        dropped_edge_index = edge_index[:, edge_mask]
-        dropped_edge_attr = edge_attr[edge_mask] if edge_attr is not None else None
-        return dropped_edge_index, dropped_edge_attr
-
-    # --- OPTIMIZATION 3: Refactor GNN Layer Application ---
     def _apply_gnn_layer(self, layer: nn.Module, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
-        """Applies a single GNN layer based on its type, centralizing logic."""
-        if self.gnn_layer_type in ["gcn", "gat", "gin", "graphsage"]:
-            return layer(x, edge_index)
+        if self.gnn_layer_type in ["gcn", "gat", "gin", "graphsage"]: return layer(x, edge_index)
         elif self.gnn_layer_type in ["rgcn", "rgat"]:
-            if self.use_edge_attr and edge_attr is not None:
-                return layer(x, edge_index, edge_attr)
-            else:
-                default_edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
-                return layer(x, edge_index, default_edge_attr)
-        else:
-            # This path should not be reached due to the check in __init__
-            raise ValueError(f"Unsupported GNN layer type: {self.gnn_layer_type}")
+            if self.use_edge_attr and edge_attr is not None: return layer(x, edge_index, edge_attr)
+            else: return layer(x, edge_index, torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device))
+        else: raise ValueError(f"Unsupported GNN layer type: {self.gnn_layer_type}")
 
     def _gnn_forward_pass(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
-        """
-        Apply GNN layers with optional initial projection, residual connections, 
-        normalization, activation and dropout. Also handles neighbor sampling.
-        """
-        target_dtype = next(self.parameters()).dtype
-        x = x.to(target_dtype)
-
-        x_orig = x
-        
-        if self.initial_projection is not None:
-            x = self.initial_projection(x)
-        
+        x, x_orig = x.to(next(self.parameters()).dtype), x
+        if self.initial_projection is not None: x = self.initial_projection(x)
         for i, layer in enumerate(self.layers):
-            # Determine which edges to use for this layer's message passing
-            # Check if neighbor sampling is configured and active for the current layer
-            use_neighbor_sampling = (
-                self.hparams.neighbor_sampling_sizes is not None and
-                self.training and
-                i < len(self.hparams.neighbor_sampling_sizes) and
-                self.hparams.neighbor_sampling_sizes[i] >= 0
-            )
-
+            use_neighbor_sampling = self.hparams.neighbor_sampling_sizes is not None and self.training and i < len(self.hparams.neighbor_sampling_sizes) and self.hparams.neighbor_sampling_sizes[i] >= 0
             if use_neighbor_sampling:
-                # If so, perform neighbor sampling
                 k = self.hparams.neighbor_sampling_sizes[i]
-                layer_edge_index, layer_edge_attr = self._sample_neighbors(
-                    edge_index, edge_attr, k
-                )
+                layer_edge_index, layer_edge_attr = self._sample_neighbors(edge_index, edge_attr, k)
             else:
-                # Otherwise, fall back to the original global edge dropout logic
-                layer_edge_index, layer_edge_attr = self._apply_edge_dropout(
-                    edge_index, edge_attr
-                )
-
+                layer_edge_index, layer_edge_attr = self._apply_edge_dropout(edge_index, edge_attr)
             x_residual = x
-            
-            # Use the refactored helper method with the selected edges
             x = self._apply_gnn_layer(layer, x, layer_edge_index, layer_edge_attr)
-            
-            if self.norm_layers is not None and i < len(self.norm_layers):
-                x = self.norm_layers[i](x)
-            
-            if self.use_residual and x.shape == x_residual.shape:
-                x = x + x_residual
-            elif self.use_residual and i == 0 and self.residual_projection is not None:
-                x = x + self.residual_projection(x_orig)
-                    
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout_p, training=self.training)
-        
-        if self.final_projection is not None:
-            x = self.final_projection(x)
-        
+            if self.norm_layers is not None and i < len(self.norm_layers): x = self.norm_layers[i](x)
+            if self.use_residual and x.shape == x_residual.shape: x = x + x_residual
+            elif self.use_residual and i == 0 and self.residual_projection is not None: x = x + self.residual_projection(x_orig)
+            if i < len(self.layers) - 1: x = F.relu(F.dropout(x, p=self.dropout_p, training=self.training))
+        if self.final_projection is not None: x = self.final_projection(x)
         return x
 
     def _get_target_device_and_dtype(self) -> Tuple[torch.device, torch.dtype]:
-        """Get target device and dtype from the first layer."""
         first_layer = self.layers[0]
-        if hasattr(first_layer, 'weight'):
-            return first_layer.weight.device, first_layer.weight.dtype
-        elif hasattr(first_layer, 'lin_l') and hasattr(first_layer.lin_l, 'weight'):
-            return first_layer.lin_l.weight.device, first_layer.lin_l.weight.dtype
-        else:
-            param = next(self.parameters())
-            return param.device, param.dtype
+        if hasattr(first_layer, 'weight'): return first_layer.weight.device, first_layer.weight.dtype
+        elif hasattr(first_layer, 'lin_l') and hasattr(first_layer.lin_l, 'weight'): return first_layer.lin_l.weight.device, first_layer.lin_l.weight.dtype
+        else: param = next(self.parameters()); return param.device, param.dtype
 
-    def _create_augmented_graph_full(
-        self, 
-        node_features: torch.FloatTensor, 
-        context_features: torch.FloatTensor, 
-        edge_index: torch.LongTensor,
-        edge_attr: Optional[torch.LongTensor],
-        lctx_neighbor_indices: List[torch.LongTensor],
-        goal_neighbor_indices: List[torch.LongTensor],
-    ) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor]]:
-        """
-        Create augmented graph using vectorized operations to avoid CPU-bound loops.
-        """
+    def _create_augmented_graph_full(self, node_features: torch.FloatTensor, context_features: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor], lctx_neighbor_indices: List[torch.LongTensor], goal_neighbor_indices: List[torch.LongTensor]) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor]]:
         target_device, target_dtype = self._get_target_device_and_dtype()
-        num_premises = node_features.shape[0]
-        num_contexts = context_features.shape[0]
-        
-        augmented_features = torch.cat(
-            [node_features.to(target_device, target_dtype), context_features.to(target_device, target_dtype)], 
-            dim=0
-        )
-
-        all_new_edges_src = []
-        all_new_edges_dst = []
-        all_new_edge_attrs = []
-        
+        num_premises, num_contexts = node_features.shape[0], context_features.shape[0]
+        augmented_features = torch.cat([node_features.to(target_device, target_dtype), context_features.to(target_device, target_dtype)], dim=0)
+        all_new_edges_src, all_new_edges_dst, all_new_edge_attrs = [], [], []
         def process_neighbors(neighbor_indices_list, edge_name_key):
             edge_name = _get_edge_type_name_from_tag(edge_name_key, self.graph_dependencies_config)
-            if not edge_name:
-                return
-            if edge_name not in self.edge_type_to_id:
-                raise ValueError(f"Edge type '{edge_name}' not found in edge_type_to_id mapping {self.edge_type_to_id}.")
-
+            if not edge_name or edge_name not in self.edge_type_to_id: return
             edge_type_id = self.edge_type_to_id[edge_name]
-            
             valid_indices = [t for t in neighbor_indices_list if t.numel() > 0]
             if not valid_indices: return
-                
             src_nodes = torch.cat(valid_indices).to(target_device)
             counts = torch.tensor([t.numel() for t in neighbor_indices_list], device=target_device)
-            context_ids = torch.arange(num_contexts, device=target_device)
-            dst_nodes = num_premises + context_ids.repeat_interleave(counts)
-            
-            all_new_edges_src.append(src_nodes)
-            all_new_edges_dst.append(dst_nodes)
-
-            if self.use_edge_attr:
-                all_new_edge_attrs.append(torch.full_like(src_nodes, fill_value=edge_type_id))
-
+            dst_nodes = num_premises + torch.arange(num_contexts, device=target_device).repeat_interleave(counts)
+            all_new_edges_src.append(src_nodes); all_new_edges_dst.append(dst_nodes)
+            if self.use_edge_attr: all_new_edge_attrs.append(torch.full_like(src_nodes, fill_value=edge_type_id))
         sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
         verbosity = sig_cfg.get('verbosity', 'verbose')
         process_neighbors(lctx_neighbor_indices, f"signature_{verbosity}_lctx")
         process_neighbors(goal_neighbor_indices, f"signature_{verbosity}_goal")
-
         if all_new_edges_src:
             new_edges = torch.stack([torch.cat(all_new_edges_src), torch.cat(all_new_edges_dst)])
             augmented_edge_index = torch.cat([edge_index.to(target_device), new_edges], dim=1)
-            
-            if self.use_edge_attr and edge_attr is not None and all_new_edge_attrs:
-                augmented_edge_attr = torch.cat([edge_attr.to(target_device), torch.cat(all_new_edge_attrs)])
-            else:
-                augmented_edge_attr = None
+            augmented_edge_attr = torch.cat([edge_attr.to(target_device), torch.cat(all_new_edge_attrs)]) if self.use_edge_attr and edge_attr is not None and all_new_edge_attrs else None
         else:
-            augmented_edge_index = edge_index.to(target_device)
-            augmented_edge_attr = edge_attr.to(target_device) if edge_attr is not None else None
-            
+            augmented_edge_index, augmented_edge_attr = edge_index.to(target_device), (edge_attr.to(target_device) if edge_attr is not None else None)
         return augmented_features, augmented_edge_index, augmented_edge_attr
 
-    def _get_final_embeddings(
-        self,
-        x: torch.FloatTensor,
-        node_features: torch.FloatTensor,
-        context_features: torch.FloatTensor,
-        normalize: bool,
-        regimes: List[str],
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        """
-        Computes the final premise and context embeddings after GNN pass and post-processing.
-        Applies different post-processing regimes to each context in the batch.
-        """
+    def _get_final_embeddings(self, x: torch.FloatTensor, node_features: torch.FloatTensor, context_features: torch.FloatTensor, normalize: bool, regimes: List[str]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         num_premises = node_features.shape[0]
-        gnn_premise_embs = x[:num_premises]
-        gnn_context_embs = x[num_premises:]
-
+        gnn_premise_embs, gnn_context_embs = x[:num_premises], x[num_premises:]
         if self.hparams.postprocess_gnn_embeddings == "gnn":
-            final_premise_embs = gnn_premise_embs
-            final_context_embs = gnn_context_embs
+            final_premise_embs, final_context_embs = gnn_premise_embs, gnn_context_embs
         else:
-            # Common setup for concat/gating
-            original_premise_embs = node_features.to(gnn_premise_embs.device, gnn_premise_embs.dtype)
-            original_context_embs = context_features.to(gnn_context_embs.device, gnn_context_embs.dtype)
-            
+            original_premise_embs, original_context_embs = node_features.to(gnn_premise_embs.device, gnn_premise_embs.dtype), context_features.to(gnn_context_embs.device, gnn_context_embs.dtype)
             if normalize:
-                gnn_premise_embs = F.normalize(gnn_premise_embs, p=2, dim=1, eps=1e-12)
-                gnn_context_embs = F.normalize(gnn_context_embs, p=2, dim=1, eps=1e-12)
-                original_premise_embs = F.normalize(original_premise_embs, p=2, dim=1, eps=1e-12)
-                original_context_embs = F.normalize(original_context_embs, p=2, dim=1, eps=1e-12)
-
-            # PREMISE EMBEDDINGS: Always use 'no_drop' regime for a consistent set of targets within the batch.
-            if self.hparams.postprocess_gnn_embeddings == "concat":
-                final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
-            elif self.hparams.postprocess_gnn_embeddings == "gating":
-                gate_premise = torch.sigmoid(self.gating_layer(torch.cat([gnn_premise_embs, original_premise_embs], dim=1)))
-                final_premise_embs = gnn_premise_embs + gate_premise * original_premise_embs
-            else:
-                raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
-
-            # CONTEXT EMBEDDINGS: Use per-context regimes for augmentation.
+                gnn_premise_embs, gnn_context_embs = F.normalize(gnn_premise_embs, p=2, dim=1), F.normalize(gnn_context_embs, p=2, dim=1)
+                original_premise_embs, original_context_embs = F.normalize(original_premise_embs, p=2, dim=1), F.normalize(original_context_embs, p=2, dim=1)
+            if self.hparams.postprocess_gnn_embeddings == "concat": final_premise_embs = torch.cat([gnn_premise_embs, original_premise_embs], dim=1)
+            elif self.hparams.postprocess_gnn_embeddings == "gating": final_premise_embs = gnn_premise_embs + torch.sigmoid(self.gating_layer(torch.cat([gnn_premise_embs, original_premise_embs], dim=1))) * original_premise_embs
+            else: raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
             original_part = torch.zeros_like(original_context_embs)
             if self.training:
                 no_drop_mask = torch.tensor([r == 'no_drop' for r in regimes], device=self.device)
-                if no_drop_mask.any():
-                    original_part[no_drop_mask] = original_context_embs[no_drop_mask]
-            else: # During eval/predict, 'no_drop' is always used.
-                original_part = original_context_embs
-
-            if self.hparams.postprocess_gnn_embeddings == "concat":
-                final_context_embs = torch.cat([gnn_context_embs, original_part], dim=1)
-            elif self.hparams.postprocess_gnn_embeddings == "gating":
-                gate_context = torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_part], dim=1)))
-                final_context_embs = gnn_context_embs + gate_context * original_part
-                
-        # The final result is normalized only if requested for MSE loss.
+                if no_drop_mask.any(): original_part[no_drop_mask] = original_context_embs[no_drop_mask]
+            else: original_part = original_context_embs
+            if self.hparams.postprocess_gnn_embeddings == "concat": final_context_embs = torch.cat([gnn_context_embs, original_part], dim=1)
+            elif self.hparams.postprocess_gnn_embeddings == "gating": final_context_embs = gnn_context_embs + torch.sigmoid(self.gating_layer(torch.cat([gnn_context_embs, original_part], dim=1))) * original_part
         if normalize:
-            final_premise_embs = F.normalize(final_premise_embs, p=2, dim=1, eps=1e-12)
-            final_context_embs = F.normalize(final_context_embs, p=2, dim=1, eps=1e-12)
-            
+            final_premise_embs, final_context_embs = F.normalize(final_premise_embs, p=2, dim=1), F.normalize(final_context_embs, p=2, dim=1)
         return final_premise_embs, final_context_embs
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "GNNRetriever":
         return load_checkpoint(cls, ckpt_path, device, freeze)
 
-    def forward(
-        self,
-        node_features: torch.FloatTensor,
-        edge_index: torch.LongTensor,
-        context_features: torch.FloatTensor,
-        lctx_neighbor_indices: List[torch.LongTensor],
-        goal_neighbor_indices: List[torch.LongTensor],
-        pos_premise_indices: torch.LongTensor,
-        neg_premises_indices: List[torch.LongTensor],
-        label: torch.FloatTensor,
-        edge_attr: Optional[torch.LongTensor] = None,
-    ) -> torch.FloatTensor:
-        """
-        This method contains the logic for training with pre-sampled, in-batch random negatives.
-        It is called by `training_step` when `negative_mining.strategy` is 'random'.
-        """
-        augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(
-            node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices
-        )
-        
-        num_contexts = context_features.shape[0]
-        per_context_regimes: List[str]
-
-        if self.training:
-            # Sample a regime for each context in the batch.
-            regime_indices = torch.multinomial(
-                torch.tensor(self.regime_probs, device=self.device),
-                num_samples=num_contexts,
-                replacement=True
-            )
-            per_context_regimes = [self.regimes[i] for i in regime_indices]
-            
-            # Create mask for context features that are 'full_drop'.
-            # This only masks the initial features for context ghost nodes, not shared premise nodes.
-            full_drop_mask = (regime_indices == self.regimes.index('full_drop'))
-            if full_drop_mask.any():
-                num_premises = node_features.shape[0]
-                context_part_features = augmented_features[num_premises:]
-                
-                context_mask = torch.ones_like(context_part_features)
-                num_to_drop = full_drop_mask.sum()
-                drop_prob = self.hparams.full_drop_prob
-                
-                # Generate a per-node mask (broadcast across features) only for the contexts that need it.
-                random_mask = (torch.rand(num_to_drop, 1, device=self.device) > drop_prob).to(augmented_features.dtype) # TODO this has to change
-                context_mask[full_drop_mask] = random_mask
-                
-                # Apply the mask to the context part of the features.
-                augmented_features[num_premises:] = context_part_features * context_mask
-        else:
-            per_context_regimes = ["no_drop"] * num_contexts
-            
-        x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
-
-        normalize_for_mse = self.hparams.loss_function == "mse"
-        final_premise_embs, final_context_embs = self._get_final_embeddings(
-            x, node_features, context_features, normalize=normalize_for_mse, regimes=per_context_regimes
-        )
-
-        pos_premise_emb = final_premise_embs[pos_premise_indices]
-        neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
-        all_premise_embs = torch.cat([pos_premise_emb] + neg_premise_embs_flat, dim=0)
-
-        scores = torch.mm(final_context_embs, all_premise_embs.t())
-
-        if self.hparams.loss_function == "mse":
-            assert -1.001 <= scores.min() <= scores.max() <= 1.001, f"Got {scores.min()} and {scores.max()}"
-            loss = F.mse_loss(scores, label)
-        elif self.hparams.loss_function == "cross_entropy":
-            loss = F.binary_cross_entropy_with_logits(scores, label)
-        else:
-            # This path should not be reached due to the check in __init__
-            raise ValueError(f"Unknown loss function: {self.hparams.loss_function}")
-
-        return loss
-
     def on_train_epoch_start(self) -> None:
-        """Calculate and store the batch indices for logging in this epoch."""
-        if not self.trainer or not hasattr(self.trainer, 'train_dataloader'):
-            self.logging_steps = []
-            return
-
+        if not self.trainer or not hasattr(self.trainer, 'train_dataloader'): self.logging_steps = []; return
         total_batches = len(self.trainer.train_dataloader)
-        if total_batches == 0:
-            self.logging_steps = []
-            return
-            
+        if total_batches == 0: self.logging_steps = []; return
         num_logs = self.hparams.num_logs_per_epoch
-        if num_logs <= 0:
-            self.logging_steps = []
-            return
-
-        if num_logs > total_batches:
-            num_logs = total_batches
-
+        if num_logs <= 0: self.logging_steps = []; return
+        if num_logs > total_batches: num_logs = total_batches
         interval = total_batches // num_logs if num_logs > 0 else total_batches
         self.logging_steps = [(i * interval) for i in range(num_logs)]
-        # Log on the very last batch if it's not already included
-        if total_batches - 1 not in self.logging_steps:
-             self.logging_steps.append(total_batches - 1)
+        if total_batches - 1 not in self.logging_steps: self.logging_steps.append(total_batches - 1)
         self.logging_steps = sorted(list(set(self.logging_steps)))
-
         logger.info(f"Epoch {self.current_epoch}: Will log training samples at batch indices: {self.logging_steps}")
 
     @torch.no_grad()
     def _log_training_sample(self, batch: Dict[str, Any], batch_idx: int):
-        """Logs a single sample from the batch for inspection during training."""
         self.eval()
-        context_text = batch["context"][0].serialize()
-        lctx_indices = batch["lctx_neighbor_indices"][0]
-        goal_indices = batch["goal_neighbor_indices"][0]
-        corpus = self.trainer.datamodule.corpus
-
+        context_text, lctx_indices, goal_indices, corpus = batch["context"][0].serialize(), batch["lctx_neighbor_indices"][0], batch["goal_neighbor_indices"][0], self.trainer.datamodule.corpus
         logger.info(f"\n--- Training Sample Log (Epoch: {self.current_epoch}, Batch: {batch_idx}, Global Step: {self.global_step}) ---")
-        logger.info(f"State/Goal Text: \n{context_text}")
-        logger.info("  Ingoing Edges to Ghost Node:")
-        for idx in lctx_indices:
-            logger.info(f"    <- [lctx] <- {corpus.all_premises[idx.item()].full_name}")
-        for idx in goal_indices:
-            logger.info(f"    <- [goal] <- {corpus.all_premises[idx.item()].full_name}")
-
+        logger.info(f"State/Goal Text: \n{context_text}"); logger.info("  Ingoing Edges to Ghost Node:")
+        for idx in lctx_indices: logger.info(f"    <- [lctx] <- {corpus.all_premises[idx.item()].full_name}")
+        for idx in goal_indices: logger.info(f"    <- [goal] <- {corpus.all_premises[idx.item()].full_name}")
         initial_context_emb = batch["context_features"][0]
         logger.info(f"  Initial Context Embedding (first 8 values): {initial_context_emb[:8].cpu().numpy()}")
-
-        aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
-            batch["node_features"], batch["context_features"][[0]], batch["edge_index"],
-            batch.get("edge_attr"), [batch["lctx_neighbor_indices"][0]], [batch["goal_neighbor_indices"][0]],
-        )
+        aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(batch["node_features"], batch["context_features"][[0]], batch["edge_index"], batch.get("edge_attr"), [batch["lctx_neighbor_indices"][0]], [batch["goal_neighbor_indices"][0]])
         x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
-        
-        # Log the final embedding as it is used in loss calculation
         normalize = self.hparams.loss_function == "mse"
-        _, final_context_emb = self._get_final_embeddings(
-            x,
-            batch["node_features"],
-            batch["context_features"][[0]],
-            normalize=normalize,
-            regimes=["no_drop"] # Use no_drop for logging consistency
-        )
+        _, final_context_emb = self._get_final_embeddings(x, batch["node_features"], batch["context_features"][[0]], normalize=normalize, regimes=["no_drop"])
         final_context_emb_vec = final_context_emb.squeeze(0)
-
-        logger.info(f"  Final ({'Normalized' if normalize else 'Unnormalized'}) Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}")
-        logger.info("--- End of Training Sample Log ---")
+        logger.info(f"  Final ({'Normalized' if normalize else 'Unnormalized'}) Context Embedding (first 8 values):   {final_context_emb_vec[:8].cpu().numpy()}"); logger.info("--- End of Training Sample Log ---")
         self.train()
 
     @torch.no_grad()
     def forward_embeddings(self, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
-        """
-        Public method to apply GNN layers to embeddings. Used for external inference.
-        """
-        was_training = self.training
-        self.eval()
-        try:
-            return self._gnn_forward_pass(x, edge_index, edge_attr)
-        finally:
-            self.train(was_training)
+        was_training = self.training; self.eval()
+        try: return self._gnn_forward_pass(x, edge_index, edge_attr)
+        finally: self.train(was_training)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         if self.hparams.negative_mining['strategy'] == 'hard':
-            # --- ONLINE HARD NEGATIVE MINING ---
-            # 1. Get GNN-refined embeddings for contexts and all premises.
-            augmented_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
-                batch["node_features"], batch["context_features"], batch["edge_index"],
-                batch.get("edge_attr"), batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
-            )
+            augmented_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(batch["node_features"], batch["context_features"], batch["edge_index"], batch.get("edge_attr"), batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"])
             x = self._gnn_forward_pass(augmented_features, aug_edge_index, aug_edge_attr)
-
             normalize = self.hparams.loss_function == "mse"
-            regimes = ["no_drop"] * batch["context_features"].shape[0] # Use 'no_drop' for mining
-            final_premise_embs, final_context_embs = self._get_final_embeddings(
-                x, batch["node_features"], batch["context_features"], normalize=normalize, regimes=regimes
-            )
-
-            # 2. Compute scores between all contexts and all premises.
+            regimes = ["no_drop"] * batch["context_features"].shape[0]
+            final_premise_embs, final_context_embs = self._get_final_embeddings(x, batch["node_features"], batch["context_features"], normalize=normalize, regimes=regimes)
             all_scores = torch.mm(final_context_embs, final_premise_embs.t())
-
-            # 3. Mask out positive premises to avoid selecting them as negatives.
             batch_size, num_premises = all_scores.shape
-            pos_mask = torch.zeros_like(all_scores, dtype=torch.bool)
-            for i in range(batch_size):
-                pos_indices = batch['all_pos_premise_indices'][i]
-                if pos_indices.numel() > 0:
-                    pos_mask[i, pos_indices] = True
-            all_scores.masked_fill_(pos_mask, -torch.inf)
-
-            # 4. Mine hard negatives (in-file and global).
-            num_neg = self.hparams.negative_mining['num_negatives']
-            num_in_file_neg = self.hparams.negative_mining['num_in_file_negatives']
             
+            # --- FIX: Initialize pos_mask BEFORE it is used ---
+            pos_mask = torch.zeros_like(all_scores, dtype=torch.bool)
+            
+            all_pos_indices_flat = [p for p in batch['all_pos_premise_indices'] if p.numel() > 0]
+            if all_pos_indices_flat:
+                 all_pos_indices = torch.cat(all_pos_indices_flat)
+                 batch_indices = torch.arange(batch_size, device=all_scores.device).repeat_interleave(
+                     torch.tensor([p.numel() for p in batch['all_pos_premise_indices']], device=all_scores.device)
+                 )
+                 pos_mask[batch_indices, all_pos_indices] = True
+            
+            all_scores.masked_fill_(pos_mask, -torch.inf)
+            num_neg, num_in_file_neg = self.hparams.negative_mining['num_negatives'], self.hparams.negative_mining['num_in_file_negatives']
             hard_neg_indices_parts = []
-
-            # In-file hard negatives
+            
             if num_in_file_neg > 0:
-                in_file_scores = torch.full_like(all_scores, -torch.inf)
                 in_file_mask = torch.zeros_like(all_scores, dtype=torch.bool)
-                for i in range(batch_size):
-                    in_file_indices = batch['accessible_in_file_indices'][i]
-                    if in_file_indices.numel() > 0:
-                        in_file_scores[i, in_file_indices] = all_scores[i, in_file_indices]
-                        in_file_mask[i, in_file_indices] = True
+                all_in_file_indices_flat = [p for p in batch['accessible_in_file_indices'] if p.numel() > 0]
+                if all_in_file_indices_flat:
+                    all_in_file_indices = torch.cat(all_in_file_indices_flat)
+                    in_file_batch_indices = torch.arange(batch_size, device=all_scores.device).repeat_interleave(
+                        torch.tensor([p.numel() for p in batch['accessible_in_file_indices']], device=all_scores.device)
+                    )
+                    in_file_mask[in_file_batch_indices, all_in_file_indices] = True
                 
+                in_file_scores = all_scores.clone(); in_file_scores.masked_fill_(~in_file_mask, -torch.inf)
                 _, in_file_negs = torch.topk(in_file_scores, k=num_in_file_neg, dim=1)
-                hard_neg_indices_parts.append(in_file_negs)
-                all_scores.masked_fill_(in_file_mask, -torch.inf) # Mask from global selection
-
-            # Global hard negatives
+                hard_neg_indices_parts.append(in_file_negs); all_scores.masked_fill_(in_file_mask, -torch.inf)
+            
             num_global_neg = num_neg - num_in_file_neg
             if num_global_neg > 0:
                 _, global_negs = torch.topk(all_scores, k=num_global_neg, dim=1)
                 hard_neg_indices_parts.append(global_negs)
-
+            
             hard_neg_indices = torch.cat(hard_neg_indices_parts, dim=1)
-
-            # 5. Construct tensors for loss calculation.
             pos_indices = batch['pos_premise_indices'].unsqueeze(1)
-            all_indices = torch.cat([pos_indices, hard_neg_indices], dim=1) # [B, 1+N]
-
-            # This line uses direct indexing, which is faster
-            batch_embs = final_premise_embs[all_indices] # [B, 1+N, D]
-            context_embs_exp = final_context_embs.unsqueeze(1) # [B, 1, D]
-            scores = torch.bmm(context_embs_exp, batch_embs.transpose(1, 2)).squeeze(1)
-
-            # 6. Create label and compute loss.
-            new_label = torch.zeros_like(scores)
-            new_label[:, 0] = 1.0
-            # Check if any mined negatives were actually positives (shouldn't happen with masking).
-            for i in range(batch_size):
-                pos_set = set(batch['all_pos_premise_indices'][i].tolist())
-                for j in range(num_neg):
-                    if hard_neg_indices[i, j].item() in pos_set:
-                        new_label[i, 1 + j] = 1.0
-
-            if self.hparams.loss_function == "mse":
-                loss = F.mse_loss(scores, new_label)
-            else:
-                loss = F.binary_cross_entropy_with_logits(scores, new_label)
-
+            all_indices = torch.cat([pos_indices, hard_neg_indices], dim=1)
+            batch_embs = final_premise_embs[all_indices]
+            scores = torch.bmm(final_context_embs.unsqueeze(1), batch_embs.transpose(1, 2)).squeeze(1)
+            new_label = torch.zeros_like(scores); new_label[:, 0] = 1.0
+            is_actually_positive = torch.gather(pos_mask, 1, hard_neg_indices)
+            new_label[:, 1:] = is_actually_positive.float()
+            
+            loss = F.mse_loss(scores, new_label) if self.hparams.loss_function == "mse" else F.binary_cross_entropy_with_logits(scores, new_label)
         else:
-            # --- OFFLINE RANDOM NEGATIVE SAMPLING (Original Logic) ---
-            loss = self(
-                batch["node_features"], batch["edge_index"], batch["context_features"],
-                batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"],
-                batch["pos_premise_indices"], batch["neg_premises_indices"],
-                batch["label"], batch.get("edge_attr", None),
-            )
-
+            node_features, edge_index, context_features = batch["node_features"], batch["edge_index"], batch["context_features"]
+            lctx_neighbor_indices, goal_neighbor_indices = batch["lctx_neighbor_indices"], batch["goal_neighbor_indices"]
+            edge_attr, pos_premise_indices, neg_premises_indices, label = batch.get("edge_attr", None), batch["pos_premise_indices"], batch["neg_premises_indices"], batch["label"]
+            augmented_features, augmented_edge_index, augmented_edge_attr = self._create_augmented_graph_full(node_features, context_features, edge_index, edge_attr, lctx_neighbor_indices, goal_neighbor_indices)
+            num_contexts = context_features.shape[0]
+            if self.training:
+                regime_indices = torch.multinomial(torch.tensor(self.regime_probs, device=self.device), num_samples=num_contexts, replacement=True)
+                per_context_regimes = [self.regimes[i] for i in regime_indices]
+                full_drop_mask = (regime_indices == self.regimes.index('full_drop'))
+                if full_drop_mask.any():
+                    context_part_features = augmented_features[node_features.shape[0]:]; context_mask = torch.ones_like(context_part_features)
+                    random_mask = (torch.rand(full_drop_mask.sum(), 1, device=self.device) > self.hparams.full_drop_prob).to(augmented_features.dtype)
+                    context_mask[full_drop_mask] = random_mask; augmented_features[node_features.shape[0]:] = context_part_features * context_mask
+            else: per_context_regimes = ["no_drop"] * num_contexts
+            x = self._gnn_forward_pass(augmented_features, augmented_edge_index, augmented_edge_attr)
+            final_premise_embs, final_context_embs = self._get_final_embeddings(x, node_features, context_features, normalize=self.hparams.loss_function == "mse", regimes=per_context_regimes)
+            pos_premise_emb = final_premise_embs[pos_premise_indices]
+            neg_premise_embs_flat = [final_premise_embs[neg_idxs] for neg_idxs in neg_premises_indices]
+            all_premise_embs = torch.cat([pos_premise_emb] + neg_premise_embs_flat, dim=0)
+            scores = torch.mm(final_context_embs, all_premise_embs.t())
+            if self.hparams.loss_function == "mse":
+                assert -1.001 <= scores.min() <= scores.max() <= 1.001, f"Got {scores.min()} and {scores.max()}"
+                loss = F.mse_loss(scores, label)
+            else: loss = F.binary_cross_entropy_with_logits(scores, label)
+        
         if hasattr(self, "logging_steps") and batch_idx in self.logging_steps:
-            if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"):
-                self._log_training_sample(batch, batch_idx)
-
+            if hasattr(self, "trainer") and hasattr(self.trainer, "datamodule"): self._log_training_sample(batch, batch_idx)
         self.log("loss_train_unregularized", loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
-
-        # --- L1 REGULARIZATION ---
         total_loss = loss
         if self.hparams.l1_lambda > 0:
-            l1_penalty = 0.0
-            # We regularize the weights of GNN layers and projection layers.
-            modules_to_regularize = list(self.layers)
-            if self.initial_projection is not None:
-                modules_to_regularize.append(self.initial_projection)
-            if self.residual_projection is not None:
-                modules_to_regularize.append(self.residual_projection)
-            if self.final_projection is not None:
-                modules_to_regularize.append(self.final_projection)
-            if hasattr(self, 'gating_layer'):
-                modules_to_regularize.append(self.gating_layer)
-
+            l1_penalty = 0.0; modules_to_regularize = list(self.layers)
+            if self.initial_projection is not None: modules_to_regularize.append(self.initial_projection)
+            if self.residual_projection is not None: modules_to_regularize.append(self.residual_projection)
+            if self.final_projection is not None: modules_to_regularize.append(self.final_projection)
+            if hasattr(self, 'gating_layer'): modules_to_regularize.append(self.gating_layer)
             for module in modules_to_regularize:
                 for name, param in module.named_parameters():
-                    if 'weight' in name:
-                        l1_penalty += torch.norm(param, 1)
-            
+                    if 'weight' in name: l1_penalty += torch.norm(param, 1)
             l1_loss = self.hparams.l1_lambda * l1_penalty
             self.log("l1_loss_train", l1_loss, on_step=True, on_epoch=True, sync_dist=True)
             total_loss = loss + l1_loss
-        # --- END L1 REGULARIZATION ---
-        
         self.log("loss_train", total_loss, on_epoch=True, sync_dist=True, batch_size=len(batch["context_features"]))
         return total_loss
 
-    # In retrieval/gnn_model.py
     def configure_optimizers(self) -> Dict[str, Any]:
-        return get_optimizers(
-            self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps, weight_decay=self.hparams.weight_decay
-        )
+        return get_optimizers(self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps, weight_decay=self.hparams.weight_decay)
     
     @torch.no_grad()
-    def compute_premise_layer_embeddings(
-        self,
-        initial_embeddings: torch.FloatTensor,
-        edge_index: torch.LongTensor,
-        edge_attr: Optional[torch.LongTensor],
-    ) -> List[torch.FloatTensor]:
-        """
-        Performs a GNN forward pass on the premise graph and caches the embeddings at each layer.
-        """
-        self.eval()
-        layer_embeddings = []
-        x = initial_embeddings
-        x_orig = x
-        
-        if self.initial_projection is not None:
-            x = self.initial_projection(x)
+    def compute_premise_layer_embeddings(self, initial_embeddings: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor]) -> List[torch.FloatTensor]:
+        self.eval(); layer_embeddings = []
+        x, x_orig = initial_embeddings, initial_embeddings
+        if self.initial_projection is not None: x = self.initial_projection(x)
         layer_embeddings.append(x.clone())
-        
         for i, layer in enumerate(self.layers):
             x_residual = x
-            
-            # Use the refactored helper method
             x = self._apply_gnn_layer(layer, x, edge_index, edge_attr)
-
-            if self.norm_layers is not None and i < len(self.norm_layers):
-                x = self.norm_layers[i](x)
-
-            if self.use_residual and x.shape == x_residual.shape:
-                x = x + x_residual
-            elif self.use_residual and i == 0 and self.residual_projection is not None:
-                x = x + self.residual_projection(x_orig)
-
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-
+            if self.norm_layers is not None and i < len(self.norm_layers): x = self.norm_layers[i](x)
+            if self.use_residual and x.shape == x_residual.shape: x = x + x_residual
+            elif self.use_residual and i == 0 and self.residual_projection is not None: x = x + self.residual_projection(x_orig)
+            if i < len(self.layers) - 1: x = F.relu(x)
             layer_embeddings.append(x.clone())
-
-        if self.final_projection is not None:
-            final_embs = self.final_projection(layer_embeddings[-1])
-            layer_embeddings.append(final_embs.clone())
-
+        if self.final_projection is not None: layer_embeddings.append(self.final_projection(layer_embeddings[-1]).clone())
         return layer_embeddings
 
-    # The rest of the file remains unchanged as it was not part of the requested optimizations
     @torch.no_grad()
-    def get_dynamic_context_embedding(
-        self,
-        initial_context_embs: torch.FloatTensor,
-        batch_lctx_neighbor_indices: List[torch.LongTensor],
-        batch_goal_neighbor_indices: List[torch.LongTensor],
-        premise_layer_embeddings: List[torch.FloatTensor],
-    ) -> torch.FloatTensor:
-        """
-        Efficiently computes final GNN-refined embeddings for a batch of contexts (ghost nodes).
-        """
-        self.eval()
-        context_embs = initial_context_embs
-
-        if self.initial_projection is not None:
-            context_embs = self.initial_projection(context_embs)
-
+    def get_dynamic_context_embedding(self, initial_context_embs: torch.FloatTensor, batch_lctx_neighbor_indices: List[torch.LongTensor], batch_goal_neighbor_indices: List[torch.LongTensor], premise_layer_embeddings: List[torch.FloatTensor]) -> torch.FloatTensor:
+        self.eval(); context_embs = initial_context_embs
+        if self.initial_projection is not None: context_embs = self.initial_projection(context_embs)
         sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
         verbosity = sig_cfg.get('verbosity', 'verbose')
-        lctx_tag = f"signature_{verbosity}_lctx"
-        goal_tag = f"signature_{verbosity}_goal"
-        lctx_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config)
-        goal_edge_name = _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
-        lctx_edge_type_id = self.edge_type_to_id.get(lctx_edge_name)
-        goal_edge_type_id = self.edge_type_to_id.get(goal_edge_name)
-
+        lctx_tag, goal_tag = f"signature_{verbosity}_lctx", f"signature_{verbosity}_goal"
+        lctx_edge_name, goal_edge_name = _get_edge_type_name_from_tag(lctx_tag, self.graph_dependencies_config), _get_edge_type_name_from_tag(goal_tag, self.graph_dependencies_config)
+        lctx_edge_type_id, goal_edge_type_id = self.edge_type_to_id.get(lctx_edge_name), self.edge_type_to_id.get(goal_edge_name)
         batch_connections = []
         for i in range(len(initial_context_embs)):
             conn_indices, conn_types = [], []
             if lctx_edge_type_id is not None and len(batch_lctx_neighbor_indices[i]) > 0:
-                conn_indices.append(batch_lctx_neighbor_indices[i])
-                conn_types.append(torch.full_like(batch_lctx_neighbor_indices[i], lctx_edge_type_id))
+                conn_indices.append(batch_lctx_neighbor_indices[i]); conn_types.append(torch.full_like(batch_lctx_neighbor_indices[i], lctx_edge_type_id))
             if goal_edge_type_id is not None and len(batch_goal_neighbor_indices[i]) > 0:
-                conn_indices.append(batch_goal_neighbor_indices[i])
-                conn_types.append(torch.full_like(batch_goal_neighbor_indices[i], goal_edge_type_id))
-            
-            batch_connections.append(
-                (torch.cat(conn_indices), torch.cat(conn_types)) if conn_indices else
-                (torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long))
-            )
-
+                conn_indices.append(batch_goal_neighbor_indices[i]); conn_types.append(torch.full_like(batch_goal_neighbor_indices[i], goal_edge_type_id))
+            batch_connections.append((torch.cat(conn_indices), torch.cat(conn_types)) if conn_indices else (torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)))
         for i, layer in enumerate(self.layers):
-            context_residual = context_embs
-            current_premise_embs = premise_layer_embeddings[i]
-
-            if self.gnn_layer_type == "gcn":
-                simple_conns = [con[0] for con in batch_connections]
-                context_embs = compute_ghost_node_embeddings_gcn(layer, current_premise_embs, None, context_embs.unbind(0), simple_conns)
-            elif self.gnn_layer_type == "rgcn":
-                context_embs = compute_ghost_node_embeddings_rgcn(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
-            elif self.gnn_layer_type == "graphsage":
-                simple_conns = [con[0] for con in batch_connections]
-                context_embs = compute_ghost_node_embeddings_graphsage(layer, current_premise_embs, context_embs.unbind(0), simple_conns)
-            elif self.gnn_layer_type == "gat":
-                simple_conns = [con[0] for con in batch_connections]
-                context_embs = compute_ghost_node_embeddings_gat(layer, current_premise_embs, context_embs.unbind(0), simple_conns)
-            elif self.gnn_layer_type == "rgat":
-                context_embs = compute_ghost_node_embeddings_rgat(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
-            elif self.gnn_layer_type == "gin":
-                simple_conns = [con[0] for con in batch_connections]
-                context_embs = compute_ghost_node_embeddings_gin(layer, current_premise_embs, context_embs.unbind(0), simple_conns)
-            
-            if self.norm_layers is not None and i < len(self.norm_layers):
-                context_embs = self.norm_layers[i](context_embs)
-            if self.use_residual and context_embs.shape == context_residual.shape:
-                context_embs = context_embs + context_residual
-            elif self.use_residual and i == 0 and self.residual_projection is not None:
-                context_embs = context_embs + self.residual_projection(initial_context_embs)
-            if i < len(self.layers) - 1:
-                context_embs = F.relu(context_embs)
-
-        if self.final_projection is not None:
-            context_embs = self.final_projection(context_embs)
-
-        if self.hparams.postprocess_gnn_embeddings == "gnn":
-            final_embs = F.normalize(context_embs, p=2, dim=1, eps=1e-12)
+            context_residual, current_premise_embs = context_embs, premise_layer_embeddings[i]
+            if self.gnn_layer_type == "gcn": context_embs = compute_ghost_node_embeddings_gcn(layer, current_premise_embs, None, context_embs.unbind(0), [con[0] for con in batch_connections])
+            elif self.gnn_layer_type == "rgcn": context_embs = compute_ghost_node_embeddings_rgcn(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
+            elif self.gnn_layer_type == "graphsage": context_embs = compute_ghost_node_embeddings_graphsage(layer, current_premise_embs, context_embs.unbind(0), [con[0] for con in batch_connections])
+            elif self.gnn_layer_type == "gat": context_embs = compute_ghost_node_embeddings_gat(layer, current_premise_embs, context_embs.unbind(0), [con[0] for con in batch_connections])
+            elif self.gnn_layer_type == "rgat": context_embs = compute_ghost_node_embeddings_rgat(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
+            elif self.gnn_layer_type == "gin": context_embs = compute_ghost_node_embeddings_gin(layer, current_premise_embs, context_embs.unbind(0), [con[0] for con in batch_connections])
+            if self.norm_layers is not None and i < len(self.norm_layers): context_embs = self.norm_layers[i](context_embs)
+            if self.use_residual and context_embs.shape == context_residual.shape: context_embs = context_embs + context_residual
+            elif self.use_residual and i == 0 and self.residual_projection is not None: context_embs = context_embs + self.residual_projection(initial_context_embs)
+            if i < len(self.layers) - 1: context_embs = F.relu(context_embs)
+        if self.final_projection is not None: context_embs = self.final_projection(context_embs)
+        if self.hparams.postprocess_gnn_embeddings == "gnn": final_embs = F.normalize(context_embs, p=2, dim=1)
         else:
-            # Both 'concat' and 'gating' need the original embeddings
-            orig_embs_norm = F.normalize(initial_context_embs, p=2, dim=1, eps=1e-12)
-            gnn_embs_norm = F.normalize(context_embs, p=2, dim=1, eps=1e-12)
-
-            if self.hparams.postprocess_gnn_embeddings == "concat":
-                final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1, eps=1e-12)
+            orig_embs_norm, gnn_embs_norm = F.normalize(initial_context_embs, p=2, dim=1), F.normalize(context_embs, p=2, dim=1)
+            if self.hparams.postprocess_gnn_embeddings == "concat": final_embs = F.normalize(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1), p=2, dim=1)
             elif self.hparams.postprocess_gnn_embeddings == "gating":
-                gate = torch.sigmoid(self.gating_layer(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1)))
-                fused_embs = gnn_embs_norm + gate * orig_embs_norm
-                final_embs = F.normalize(fused_embs, p=2, dim=1, eps=1e-12)
-            else:
-                raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
-            
+                fused_embs = gnn_embs_norm + torch.sigmoid(self.gating_layer(torch.cat([gnn_embs_norm, orig_embs_norm], dim=1))) * orig_embs_norm
+                final_embs = F.normalize(fused_embs, p=2, dim=1)
+            else: raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
         return final_embs
