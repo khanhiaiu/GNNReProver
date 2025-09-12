@@ -146,3 +146,4 @@ scripts/create_test_subset.py
 scripts/check_gnn_environment.sh
 retrieval/confs/cli_gnn_quick_test.yaml
 QUICK_TEST_README.md
+tests/test_gnn_utils.py
