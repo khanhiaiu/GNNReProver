@@ -367,6 +367,22 @@ class GNNRetriever(pl.LightningModule):
             new_label = torch.zeros_like(scores); new_label[:, 0] = 1.0
             is_actually_positive = torch.gather(pos_mask, 1, hard_neg_indices)
             new_label[:, 1:] = is_actually_positive.float()
+
+            with torch.no_grad():
+                pos_scores = scores[:, 0]
+                self.log(
+                    "hard_mining/pos_premise_score",
+                    pos_scores.mean(),
+                    on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size
+                )
+                if scores.shape[1] > 1:
+                    hard_neg_scores = scores[:, 1:]
+                    hardest_neg_score, _ = torch.max(hard_neg_scores, dim=1)
+                    self.log(
+                        "hard_mining/hardest_neg_score",
+                        hardest_neg_score.mean(),
+                        on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size
+                    )
             
             loss = F.mse_loss(scores, new_label) if self.hparams.loss_function == "mse" else F.binary_cross_entropy_with_logits(scores, new_label)
         else:
