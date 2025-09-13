@@ -17,21 +17,28 @@ trainer:
       name: gated_gnn_standard_reg
       save_dir: lightning_logs/gated_gnn_standard_reg
   gradient_clip_val: 1.0
-  max_steps: 20000
+  accumulate_grad_batches: 6
+  max_steps: 200000
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
       init_args:
         verbose: true
         save_top_k: 1
         save_last: true
-        monitor: loss_train_epoch
-        mode: min
+        monitor: R@10_val # Monitor validation recall
+        mode: max       # Higher recall is better
+    - class_path: pytorch_lightning.callbacks.EarlyStopping
+      init_args:
+        monitor: R@10_val # Monitor the same metric
+        patience: 3       # Stop if no improvement after 3 validation epochs
+        mode: max         # Higher is better
+        verbose: true
 
 model:
   feature_size: 1472
   num_layers: 2
-  lr: 1e-4
-  warmup_steps: 300
+  lr: 1e-6
+  warmup_steps: 0
   loss_function: mse
   l1_lambda: 0.0 # Standard L1 regularization
   weight_decay: 1e-4 # Standard L2 regularization
@@ -52,14 +59,14 @@ data:
   corpus_path: data/leandojo_benchmark_4/corpus.jsonl
   retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
 
-  batch_size: 64
+  batch_size: 5120 # effective_batch_size == batch_size * accumulate_grad_batches * devices
   eval_batch_size: 4
   num_workers: 6
 
   negative_mining:
     strategy: hard
-    num_negatives: 5
-    num_in_file_negatives: 2
+    num_negatives: 4
+    num_in_file_negatives: 1
 
   graph_dependencies_config:
     mode: custom

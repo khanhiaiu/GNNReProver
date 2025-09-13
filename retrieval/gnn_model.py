@@ -80,6 +80,10 @@ class GNNRetriever(pl.LightningModule):
             }
 
         self.save_hyperparameters()
+        # Add attributes for validation
+        self.final_premise_embs_val: Optional[torch.Tensor] = None
+        self.premise_layer_embeddings_val: Optional[List[torch.Tensor]] = None
+
         assert self.hparams.loss_function in ["mse", "cross_entropy"], \
            f"loss_function must be 'mse' or 'cross_entropy', but got {self.hparams.loss_function}"
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
@@ -540,6 +544,92 @@ class GNNRetriever(pl.LightningModule):
     def configure_optimizers(self) -> Dict[str, Any]:
         return get_optimizers(self.parameters(), self.trainer, self.hparams.lr, self.hparams.warmup_steps, weight_decay=self.hparams.weight_decay)
     
+    @torch.no_grad()
+    def on_validation_start(self) -> None:
+        """
+        Compute and cache final and intermediate GNN-refined embeddings for all premises
+        before the validation loop begins. This is an expensive operation that should
+        only be done once per validation epoch.
+        """
+        self.eval()
+        logger.info("Computing final and intermediate premise embeddings for validation...")
+        
+        datamodule = self.trainer.datamodule
+        if not hasattr(datamodule, "node_features") or datamodule.node_features is None:
+            logger.error("datamodule.node_features not available. Cannot run validation.")
+            return
+
+        device = self.device
+        initial_premise_embs = datamodule.node_features.to(device, self.dtype)
+        edge_index = datamodule.corpus.premise_dep_graph.edge_index.to(device)
+        edge_attr = getattr(datamodule.corpus.premise_dep_graph, "edge_attr", None)
+        if edge_attr is not None:
+            edge_attr = edge_attr.to(device)
+
+        # Cache intermediate layer embeddings for dynamic context computation
+        self.premise_layer_embeddings_val = self.compute_premise_layer_embeddings(
+            initial_premise_embs, edge_index, edge_attr
+        )
+        final_embs = self.premise_layer_embeddings_val[-1]
+        
+        # Apply the same post-processing as the prediction step to get final premise embeddings for KNN
+        postprocess_option = self.hparams.postprocess_gnn_embeddings
+        if postprocess_option == "gnn":
+            self.final_premise_embs_val = F.normalize(final_embs, p=2, dim=1)
+        else:
+            original_embs_norm = F.normalize(initial_premise_embs, p=2, dim=1)
+            final_gnn_embs_norm = F.normalize(final_embs, p=2, dim=1)
+            if postprocess_option == "concat":
+                self.final_premise_embs_val = F.normalize(torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1), p=2, dim=1)
+            elif postprocess_option == "gating":
+                fused_embs = final_gnn_embs_norm + torch.sigmoid(self.gating_layer(torch.cat([final_gnn_embs_norm, original_embs_norm], dim=1))) * original_embs_norm
+                self.final_premise_embs_val = F.normalize(fused_embs, p=2, dim=1)
+        
+        logger.info("Validation premise embeddings are ready.")
+
+
+    @torch.no_grad()
+    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
+        self.eval()
+        if self.final_premise_embs_val is None or self.premise_layer_embeddings_val is None:
+            logger.warning("Skipping validation step as premise embeddings are not ready.")
+            return
+
+        initial_context_emb = batch["context_features"].to(self.device, self.dtype)
+        
+        final_context_embs = self.get_dynamic_context_embedding(
+            initial_context_embs=initial_context_emb,
+            batch_lctx_neighbor_indices=batch["lctx_neighbor_indices"],
+            batch_goal_neighbor_indices=batch["goal_neighbor_indices"],
+            premise_layer_embeddings=self.premise_layer_embeddings_val,
+        )
+
+        scores = torch.mm(final_context_embs, self.final_premise_embs_val.t())
+
+        num_premises = self.final_premise_embs_val.shape[0]
+        batch_size = final_context_embs.shape[0]
+        pos_mask = torch.zeros(batch_size, num_premises, dtype=torch.bool, device=self.device)
+        corpus = self.trainer.datamodule.corpus
+        for i, all_pos in enumerate(batch["all_pos_premises"]):
+            if all_pos:
+                pos_indices = [corpus.name2idx[p.full_name] for p in all_pos if p.full_name in corpus.name2idx]
+                if pos_indices:
+                    pos_mask[i, pos_indices] = True
+
+        # Calculate and log retrieval metrics
+        val_metrics = self._compute_retrieval_metrics(scores, pos_mask)
+        self.log("R@1_val", val_metrics["R@1"], on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("R@10_val", val_metrics["R@10"], on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("MRR_val", val_metrics["MRR"], on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+        # Calculate and log validation loss for observation
+        labels = pos_mask.float()
+        if self.hparams.loss_function == "mse":
+            val_loss = F.mse_loss(scores, labels)
+        else:
+            val_loss = F.binary_cross_entropy_with_logits(scores, labels)
+        self.log("loss_val", val_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
     @torch.no_grad()
     def compute_premise_layer_embeddings(self, initial_embeddings: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor]) -> List[torch.FloatTensor]:
         self.eval(); layer_embeddings = []
