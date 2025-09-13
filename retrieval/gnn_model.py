@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Dict, Any, List, Tuple, Optional
 from torch_geometric.nn import RGCNConv, GCNConv, GATConv, RGATConv, GINConv, SAGEConv
+from retrieval.gnn_modules.GatedRGCNConv import ResidualGatedRGCNConv as GatedRGCNConv
 
 from common import _get_edge_type_name_from_tag, get_optimizers, load_checkpoint
 
@@ -32,6 +33,7 @@ from retrieval.gnn_utils import (
         compute_ghost_node_embeddings_rgat,
         compute_ghost_node_embeddings_gin,
         compute_ghost_node_embeddings_graphsage,
+        compute_ghost_node_embeddings_gated_rgcn,
     )
 
 
@@ -153,6 +155,7 @@ class GNNRetriever(pl.LightningModule):
             "rgat": (RGATConv, {"out_channels": self.hidden_size, "heads": gat_heads, "num_relations": num_relations, "concat": False}),
             "gin": (GINConv, {}),
             "graphsage": (SAGEConv, {"out_channels": self.hidden_size}),
+            "gated-rgcn": (GatedRGCNConv, {"channels": self.hidden_size, "num_relations": num_relations}),
         }
 
         if self.gnn_layer_type not in layer_configs:
@@ -170,7 +173,14 @@ class GNNRetriever(pl.LightningModule):
             else:
                 layer_class, kwargs = layer_configs[self.gnn_layer_type]
                 current_kwargs = kwargs.copy()
-                if "in_channels" in GCNConv.__init__.__code__.co_varnames:
+                if self.gnn_layer_type == 'gated-rgcn':
+                    if input_size != self.hidden_size:
+                        raise ValueError(
+                            f"For 'gated-rgcn', input size ({input_size}) must equal hidden size ({self.hidden_size}). "
+                            "Consider setting use_initial_projection=True or feature_size=hidden_size."
+                        )
+                    # GatedRGCNConv takes 'channels', not 'in_channels'. The kwargs are already correct.
+                elif "in_channels" in GCNConv.__init__.__code__.co_varnames:
                     current_kwargs["in_channels"] = input_size
                 else:
                     current_kwargs["in_feats"] = input_size
@@ -203,7 +213,7 @@ class GNNRetriever(pl.LightningModule):
 
     def _apply_gnn_layer(self, layer: nn.Module, x: torch.FloatTensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.LongTensor] = None) -> torch.FloatTensor:
         if self.gnn_layer_type in ["gcn", "gat", "gin", "graphsage"]: return layer(x, edge_index)
-        elif self.gnn_layer_type in ["rgcn", "rgat"]:
+        elif self.gnn_layer_type in ["rgcn", "rgat", "gated-rgcn"]:
             if self.use_edge_attr and edge_attr is not None: return layer(x, edge_index, edge_attr)
             else: return layer(x, edge_index, torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device))
         else: raise ValueError(f"Unsupported GNN layer type: {self.gnn_layer_type}")
@@ -568,6 +578,7 @@ class GNNRetriever(pl.LightningModule):
             context_residual, current_premise_embs = context_embs, premise_layer_embeddings[i]
             if self.gnn_layer_type == "gcn": context_embs = compute_ghost_node_embeddings_gcn(layer, current_premise_embs, None, context_embs.unbind(0), [con[0] for con in batch_connections])
             elif self.gnn_layer_type == "rgcn": context_embs = compute_ghost_node_embeddings_rgcn(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
+            elif self.gnn_layer_type == "gated-rgcn": context_embs = compute_ghost_node_embeddings_gated_rgcn(layer, current_premise_embs, context_embs.unbind(0), batch_connections)
             elif self.gnn_layer_type == "graphsage": context_embs = compute_ghost_node_embeddings_graphsage(layer, current_premise_embs, context_embs.unbind(0), [con[0] for con in batch_connections])
             elif self.gnn_layer_type == "gat": context_embs = compute_ghost_node_embeddings_gat(layer, current_premise_embs, context_embs.unbind(0), [con[0] for con in batch_connections])
             elif self.gnn_layer_type == "rgat": context_embs = compute_ghost_node_embeddings_rgat(layer, current_premise_embs, context_embs.unbind(0), batch_connections)

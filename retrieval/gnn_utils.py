@@ -5,6 +5,8 @@ from torch import Tensor
 from torch_geometric.nn import GCNConv, SAGEConv
 from torch_geometric.utils import add_remaining_self_loops, scatter
 
+from retrieval.gnn_modules.GatedRGCNConv import ResidualGatedRGCNConv as GatedRGCNConv
+
 def compute_ghost_node_embeddings_gcn(
     gcn_layer: GCNConv,
     existing_node_embs: Tensor,
@@ -697,3 +699,34 @@ def compute_ghost_node_embeddings_gine(
 
     # --- 3. Apply the final MLP (`nn`) ---
     return gine_layer.nn(pre_mlp_embs)
+
+def compute_ghost_node_embeddings_gated_rgcn(
+    gated_rgcn_layer: GatedRGCNConv,
+    existing_node_embs: Tensor,
+    ghost_node_initial_embs: List[Tensor],
+    ghost_node_connections: List[Tuple[Tensor, Tensor]],
+) -> Tensor:
+    """
+    Efficiently computes ghost node embeddings for a ResidualGatedRGCNConv layer.
+    """
+    # GatedRGCNConv disables root weight and bias, so the rgcn util effectively
+    # computes only the aggregated messages from neighbors.
+    aggregated_messages = compute_ghost_node_embeddings_rgcn(
+        gated_rgcn_layer,
+        existing_node_embs,
+        # Pass dummy embeddings as root connection is not used.
+        [torch.zeros_like(e) for e in ghost_node_initial_embs],
+        ghost_node_connections,
+    )
+
+    ghost_embs_tensor = torch.stack(ghost_node_initial_embs).to(
+        existing_node_embs.device
+    )
+
+    # Apply the GRU-like gating mechanism from the layer
+    combined = torch.cat([ghost_embs_tensor, aggregated_messages], dim=-1)
+    update_gate = torch.sigmoid(gated_rgcn_layer.gate_nn(combined))
+    update_candidate = torch.tanh(gated_rgcn_layer.update_nn(combined))
+    out = (1 - update_gate) * ghost_embs_tensor + update_gate * update_candidate
+
+    return out

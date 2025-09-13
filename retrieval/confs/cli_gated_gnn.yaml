@@ -1,0 +1,72 @@
+seed_everything: 3407
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: 32-true
+  strategy:
+    class_path: pytorch_lightning.strategies.DeepSpeedStrategy
+    init_args:
+      stage: 2
+      offload_optimizer: false
+      cpu_checkpointing: false
+  logger:
+    class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      project: reprover-gnn
+      name: gated_gnn_standard_reg
+      save_dir: lightning_logs/gated_gnn_standard_reg
+  gradient_clip_val: 1.0
+  max_steps: 20000
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        verbose: true
+        save_top_k: 1
+        save_last: true
+        monitor: loss_train_epoch
+        mode: min
+
+model:
+  feature_size: 1472
+  num_layers: 2
+  lr: 1e-4
+  warmup_steps: 300
+  loss_function: mse
+  l1_lambda: 0.0 # Standard L1 regularization
+  weight_decay: 1e-4 # Standard L2 regularization
+  edge_type_to_id: {}
+  
+  # --- GNN Architecture ---
+  gnn_layer_type: gated-rgcn # Use the new Gated RGCN layer
+  hidden_size: 1472
+  use_residual: false
+  dropout_p: 0.3 # Standard dropout
+  edge_dropout_p: 0.1 # Standard edge dropout
+  norm_type: layer # Standard normalization
+  use_initial_projection: false # Required since feature_size != hidden_size
+  postprocess_gnn_embeddings: gnn # Use only GNN output as requested
+
+data:
+  data_path: data/leandojo_benchmark_4/random/
+  corpus_path: data/leandojo_benchmark_4/corpus.jsonl
+  retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
+
+  batch_size: 64
+  eval_batch_size: 4
+  num_workers: 6
+
+  negative_mining:
+    strategy: hard
+    num_negatives: 5
+    num_in_file_negatives: 2
+
+  graph_dependencies_config:
+    mode: custom
+    use_proof_dependencies: false
+    signature_and_state:
+      verbosity: clickable
+      distinguish_lctx_goal: true
+
+  attributes:
+    use_node_attributes: true
