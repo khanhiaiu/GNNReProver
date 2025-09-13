@@ -60,6 +60,7 @@ class GNNRetriever(pl.LightningModule):
         norm_type: str = "layer",
         use_initial_projection: bool = True,
         postprocess_gnn_embeddings: str = "gnn",
+        gnn_pooling_type: str = "none",
         negative_mining: Optional[Dict[str, Any]] = None,
         num_logs_per_epoch: int = 5,
         neighbor_sampling_sizes: Optional[List[int]] = None,
@@ -80,6 +81,16 @@ class GNNRetriever(pl.LightningModule):
         assert self.hparams.loss_function in ["mse", "cross_entropy"], \
            f"loss_function must be 'mse' or 'cross_entropy', but got {self.hparams.loss_function}"
         assert num_layers >= 1, "Number of GNN layers must be at least 1."
+
+        self.gnn_pooling_type = gnn_pooling_type.lower()
+        valid_pooling_types = ["none", "mean", "max", "min", "learned_weighted"]
+        assert self.gnn_pooling_type in valid_pooling_types, (
+            f"gnn_pooling_type must be one of {valid_pooling_types}, "
+            f"but got {self.gnn_pooling_type}"
+        )
+
+        if self.gnn_pooling_type == "learned_weighted":
+            self.pooling_weights_layer = nn.Linear(self.feature_size * 2, 2)
 
         # Validate and normalize mask_regime_probs
         expected_keys = {"no_drop", "drop_concat", "full_drop"}
@@ -253,10 +264,37 @@ class GNNRetriever(pl.LightningModule):
     def _get_final_embeddings(self, x: torch.FloatTensor, node_features: torch.FloatTensor, context_features: torch.FloatTensor, normalize: bool, regimes: List[str]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         num_premises = node_features.shape[0]
         gnn_premise_embs, gnn_context_embs = x[:num_premises], x[num_premises:]
+        original_premise_embs, original_context_embs = node_features.to(gnn_premise_embs.device, gnn_premise_embs.dtype), context_features.to(gnn_context_embs.device, gnn_context_embs.dtype)
+
         if self.hparams.postprocess_gnn_embeddings == "gnn":
-            final_premise_embs, final_context_embs = gnn_premise_embs, gnn_context_embs
+            if self.hparams.gnn_pooling_type == "none":
+                final_premise_embs, final_context_embs = gnn_premise_embs, gnn_context_embs
+            else:
+                # Stack for pooling: shape (N, 2, D)
+                premise_embs_stack = torch.stack([original_premise_embs, gnn_premise_embs], dim=1)
+                context_embs_stack = torch.stack([original_context_embs, gnn_context_embs], dim=1)
+
+                if self.hparams.gnn_pooling_type == "mean":
+                    final_premise_embs = torch.mean(premise_embs_stack, dim=1)
+                    final_context_embs = torch.mean(context_embs_stack, dim=1)
+                elif self.hparams.gnn_pooling_type == "max":
+                    final_premise_embs = torch.max(premise_embs_stack, dim=1).values
+                    final_context_embs = torch.max(context_embs_stack, dim=1).values
+                elif self.hparams.gnn_pooling_type == "min":
+                    final_premise_embs = torch.min(premise_embs_stack, dim=1).values
+                    final_context_embs = torch.min(context_embs_stack, dim=1).values
+                elif self.hparams.gnn_pooling_type == "learned_weighted":
+                    # Reshape for linear layer: (N, 2 * D)
+                    premise_weights_input = premise_embs_stack.view(-1, 2 * self.feature_size)
+                    # Get weights: (N, 2)
+                    premise_weights = F.softmax(self.pooling_weights_layer(premise_weights_input), dim=-1)
+                    # Apply weights and sum: (N, 2, D) * (N, 2, 1) -> sum(dim=1) -> (N, D)
+                    final_premise_embs = (premise_embs_stack * premise_weights.unsqueeze(-1)).sum(dim=1)
+
+                    context_weights_input = context_embs_stack.view(-1, 2 * self.feature_size)
+                    context_weights = F.softmax(self.pooling_weights_layer(context_weights_input), dim=-1)
+                    final_context_embs = (context_embs_stack * context_weights.unsqueeze(-1)).sum(dim=1)
         else:
-            original_premise_embs, original_context_embs = node_features.to(gnn_premise_embs.device, gnn_premise_embs.dtype), context_features.to(gnn_context_embs.device, gnn_context_embs.dtype)
             if normalize:
                 gnn_premise_embs, gnn_context_embs = F.normalize(gnn_premise_embs, p=2, dim=1), F.normalize(gnn_context_embs, p=2, dim=1)
                 original_premise_embs, original_context_embs = F.normalize(original_premise_embs, p=2, dim=1), F.normalize(original_context_embs, p=2, dim=1)
