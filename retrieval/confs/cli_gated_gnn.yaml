@@ -2,7 +2,7 @@ seed_everything: 3407
 
 trainer:
   accelerator: gpu
-  devices: 1
+  devices: 2
   precision: 32-true
   strategy:
     class_path: pytorch_lightning.strategies.DeepSpeedStrategy
@@ -16,8 +16,13 @@ trainer:
       project: reprover-gnn
       name: gated_gnn_standard_reg
       save_dir: lightning_logs/gated_gnn_standard_reg
+  
+  # --- FIXES ARE HERE ---
+  num_sanity_val_steps: 0  # Solves the initial OOM/delay by skipping pre-training validation
+  log_every_n_steps: 5     # Solves the logging issue by logging at every optimizer step
+
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 6
+  accumulate_grad_batches: 3
   max_steps: 200000
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
@@ -59,13 +64,14 @@ data:
   corpus_path: data/leandojo_benchmark_4/corpus.jsonl
   retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
 
-  batch_size: 5120 # effective_batch_size == batch_size * accumulate_grad_batches * devices
+  # Note: The effective batch size is now 2048 * 2 * 3 = 12,288
+  batch_size: 2048 
   eval_batch_size: 4
   num_workers: 6
 
   negative_mining:
     strategy: hard
-    num_negatives: 4
+    num_negatives: 3
     num_in_file_negatives: 1
 
   graph_dependencies_config:
