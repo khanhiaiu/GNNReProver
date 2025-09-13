@@ -548,3 +548,61 @@ class GNNRetriever(pl.LightningModule):
                 final_embs = F.normalize(fused_embs, p=2, dim=1)
             else: raise ValueError(f"Unknown postprocessing option: {self.hparams.postprocess_gnn_embeddings}")
         return final_embs
+
+    @torch.no_grad()
+    def get_all_dynamic_context_embeddings(
+        self,
+        initial_premise_embs: torch.FloatTensor,
+        initial_context_embs: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+        edge_attr: Optional[torch.LongTensor],
+        all_lctx_neighbor_indices: List[torch.LongTensor],
+        all_goal_neighbor_indices: List[torch.LongTensor],
+    ) -> torch.FloatTensor:
+        """
+        Computes all context embeddings in a single pass on one giant augmented graph.
+
+        This method is less efficient for dynamic, single-query settings but matches
+        the training logic exactly, making it useful for offline evaluation.
+
+        Args:
+            initial_premise_embs: Tensor of initial premise embeddings.
+            initial_context_embs: Tensor of initial embeddings for ALL unique contexts.
+            edge_index: The edge_index of the base premise graph.
+            edge_attr: The edge_attr of the base premise graph.
+            all_lctx_neighbor_indices: List of tensors, one for each context, with lctx neighbors.
+            all_goal_neighbor_indices: List of tensors, one for each context, with goal neighbors.
+
+        Returns:
+            A tensor containing the final, GNN-refined embeddings for all contexts.
+        """
+        self.eval()
+
+        # 1. Create the single, large augmented graph
+        aug_features, aug_edge_index, aug_edge_attr = self._create_augmented_graph_full(
+            initial_premise_embs,
+            initial_context_embs,
+            edge_index,
+            edge_attr,
+            all_lctx_neighbor_indices,
+            all_goal_neighbor_indices,
+        )
+
+        # 2. Run a single GNN forward pass on the entire augmented graph
+        x = self._gnn_forward_pass(aug_features, aug_edge_index, aug_edge_attr)
+
+        # 3. Extract, post-process, and normalize the embeddings
+        # We use "no_drop" regime as this is for inference.
+        num_contexts = initial_context_embs.shape[0]
+        regimes = ["no_drop"] * num_contexts
+        normalize = self.hparams.loss_function == "mse" # Match training normalization for scoring
+
+        _, final_context_embs = self._get_final_embeddings(
+            x,
+            initial_premise_embs,
+            initial_context_embs,
+            normalize=normalize,
+            regimes=regimes
+        )
+
+        return final_context_embs

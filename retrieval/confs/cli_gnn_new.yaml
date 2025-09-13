@@ -1,0 +1,80 @@
+seed_everything: 3407
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: 32-true
+  strategy:
+    class_path: pytorch_lightning.strategies.DeepSpeedStrategy
+    init_args:
+      stage: 2
+      offload_optimizer: false
+      cpu_checkpointing: false
+  logger:
+    class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      project: reprover-gnn
+      name: lm_dropout_restored_version   # from old config
+      save_dir: lightning_logs/2025-09-08_lm_dropout_rgcn1_1layers_random
+  gradient_clip_val: 1.0
+  max_steps: 20000
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        verbose: true
+        save_top_k: 1
+        save_last: true
+        monitor: loss_train_epoch
+        mode: min
+
+model:
+  feature_size: 1472
+  num_layers: 1               # overridden from old config
+  lr: 1e-4
+  warmup_steps: 100
+  loss_function: cross_entropy
+  l1_lambda: 0.0
+  weight_decay: 5e-4
+  edge_type_to_id:
+    signature_goal: 0
+    signature_lctx: 1
+  
+  # --- GNN Architecture ---
+  gnn_layer_type: rgcn
+  num_relations: 3
+  hidden_size: 2048            # overridden from old config
+  use_residual: true
+  dropout_p: 0.6              # overridden from old config
+  edge_dropout_p: 0.1
+  norm_type: layer
+  use_initial_projection: true
+  postprocess_gnn_embeddings: gnn   # overridden from old config
+  # gat_heads: 8   # present in old config, only needed if gnn_layer_type == gat
+  # use_edge_attr: true  # in old config, but redundant with edge_type_to_id usage
+  
+  # --- Training Speed Optimization ---
+  neighbor_sampling_sizes: null
+
+data:
+  data_path: data/leandojo_benchmark_4/random/    # overridden from old config
+  corpus_path: data/leandojo_benchmark_4/corpus.jsonl
+  retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
+
+  batch_size: 256
+  eval_batch_size: 4
+  num_workers: 6
+
+  negative_mining:
+    strategy: hard
+    num_negatives: 5
+    num_in_file_negatives: 2
+
+  graph_dependencies_config:
+    mode: custom
+    use_proof_dependencies: false
+    signature_and_state:
+      verbosity: clickable
+      distinguish_lctx_goal: true
+
+  attributes:
+    use_node_attributes: true

@@ -367,7 +367,12 @@ class PremiseRetriever(pl.LightningModule):
     def predict_step(self, batch: Dict[str, Any], _):
         if self.gnn_model is not None:
             # EFFICIENT DYNAMIC GNN-AWARE RETRIEVAL
-            initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
+            if "context_features" in batch:
+                # Use pre-computed embeddings from GNNDataModule.
+                initial_context_emb = batch["context_features"]
+            else:  # Fallback for when datamodule doesn't provide cached embeddings.
+                logger.warning("Falling back to re-computing context embeddings in predict_step. Consider using GNNDataModule for efficiency.")
+                initial_context_emb = self._encode(batch["context_ids"], batch["context_mask"])
 
             # --- START OF NEW LOGGING CODE ---
             if PremiseRetriever._predict_log_counter < PremiseRetriever._max_predict_logs:

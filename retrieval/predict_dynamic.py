@@ -19,7 +19,7 @@ import pytorch_lightning as pl
 
 from retrieval.model import PremiseRetriever
 from retrieval.gnn_model import GNNRetriever
-from retrieval.datamodule import RetrievalDataModule
+from retrieval.gnn_datamodule import GNNDataModule
 
 
 def main() -> None:
@@ -75,17 +75,18 @@ def main() -> None:
     # --- Step 2: Setup the datamodule with the exact configuration from training ---
     # This is the crucial step for consistency. We use the loaded hyperparameters
     # to ensure the Corpus and data processing match the training environment.
-    datamodule = RetrievalDataModule(
+    datamodule = GNNDataModule(
         data_path=args.data_path,  # Use data_path from args to allow predicting on different splits (e.g., test)
         corpus_path=data_hparams['corpus_path'],
-        model_name=args.retriever_ckpt_path, # For tokenizer
+        retriever_ckpt_path=args.retriever_ckpt_path,
         batch_size=args.batch_size,
         eval_batch_size=args.batch_size,
         num_workers=args.num_workers,
-        max_seq_len=2048, 
         graph_dependencies_config=graph_dependencies_config,
-        #num_negatives=0,  # Not needed for prediction
-        #num_in_file_negatives=0,  # Not needed for prediction
+        # These are needed by the constructor but not used for prediction.
+        # We get them from the config for consistency, with fallbacks.
+        attributes=data_hparams.get('attributes', {}),
+        negative_mining=data_hparams.get('negative_mining', {'strategy': 'random', 'num_negatives': 0, 'num_in_file_negatives': 0}),
     )
 
     # --- Step 3: Run prediction using the PyTorch Lightning Trainer ---

@@ -32,8 +32,9 @@ def gnn_collate_fn(
     corpus: Corpus,
     node_features: torch.Tensor,
     context_embeddings: Dict[str, torch.Tensor], # Receives pre-computed embeddings
-    num_negatives: int,
-    negative_mining_strategy: str,
+    is_train: bool,
+    num_negatives: Optional[int] = None,
+    negative_mining_strategy: Optional[str] = None,
 ) -> Batch:
     batch = {}
     batch["node_features"] = node_features
@@ -69,48 +70,57 @@ def gnn_collate_fn(
         goal_neighbor_indices.append(torch.tensor(indices, dtype=torch.long))
     batch["goal_neighbor_indices"] = goal_neighbor_indices
 
-    pos_premise_indices = [
-        corpus.name2idx[ex["pos_premise"].full_name] for ex in examples
-    ]
-    batch["pos_premise_indices"] = torch.tensor(pos_premise_indices, dtype=torch.long)
+    if is_train:
+        assert num_negatives is not None and negative_mining_strategy is not None
 
-    if negative_mining_strategy == "hard":
-        # Add metadata for the model to perform mining.
-        all_pos_indices = []
-        for ex in examples:
-            indices = [corpus.name2idx[p.full_name] for p in ex["all_pos_premises"] if p.full_name in corpus.name2idx]
-            all_pos_indices.append(torch.tensor(indices, dtype=torch.long))
-        batch['all_pos_premise_indices'] = all_pos_indices
+        pos_premise_indices = [
+            corpus.name2idx[ex["pos_premise"].full_name] for ex in examples
+        ]
+        batch["pos_premise_indices"] = torch.tensor(pos_premise_indices, dtype=torch.long)
 
-        accessible_in_file_indices = []
-        for ex in examples:
-            indices = [corpus.name2idx[p.full_name] for p in ex["accessible_in_file_premises"] if p.full_name in corpus.name2idx]
-            accessible_in_file_indices.append(torch.tensor(indices, dtype=torch.long))
-        batch['accessible_in_file_indices'] = accessible_in_file_indices
+        if negative_mining_strategy == "hard":
+            # Add metadata for the model to perform mining.
+            all_pos_indices = []
+            for ex in examples:
+                indices = [corpus.name2idx[p.full_name] for p in ex["all_pos_premises"] if p.full_name in corpus.name2idx]
+                all_pos_indices.append(torch.tensor(indices, dtype=torch.long))
+            batch['all_pos_premise_indices'] = all_pos_indices
+
+            accessible_in_file_indices = []
+            for ex in examples:
+                indices = [corpus.name2idx[p.full_name] for p in ex["accessible_in_file_premises"] if p.full_name in corpus.name2idx]
+                accessible_in_file_indices.append(torch.tensor(indices, dtype=torch.long))
+            batch['accessible_in_file_indices'] = accessible_in_file_indices
+        else:
+            # Use pre-sampled random negatives.
+            batch["neg_premises_indices"] = []
+            for i in range(num_negatives):
+                neg_indices = [
+                    corpus.name2idx[ex["neg_premises"][i].full_name] for ex in examples
+                ]
+                batch["neg_premises_indices"].append(torch.tensor(neg_indices, dtype=torch.long))
+
+            batch_size = len(examples)
+            label = torch.zeros(batch_size, batch_size * (1 + num_negatives))
+
+            for j in range(batch_size):
+                all_pos_premises_names = {p.full_name for p in examples[j]["all_pos_premises"]}
+                for k in range(batch_size * (1 + num_negatives)):
+                    if k < batch_size:
+                        p_name_k = examples[k]["pos_premise"].full_name
+                    else:
+                        p_name_k = examples[k % batch_size]["neg_premises"][
+                            k // batch_size - 1
+                        ].full_name
+                    label[j, k] = float(p_name_k in all_pos_premises_names)
+
+            batch["label"] = label
     else:
-        # Use pre-sampled random negatives.
-        batch["neg_premises_indices"] = []
-        for i in range(num_negatives):
-            neg_indices = [
-                corpus.name2idx[ex["neg_premises"][i].full_name] for ex in examples
-            ]
-            batch["neg_premises_indices"].append(torch.tensor(neg_indices, dtype=torch.long))
+        # For prediction/validation, pass through all extra data for evaluation.
+        for k in examples[0].keys():
+            if k not in batch:
+                batch[k] = [ex[k] for ex in examples]
 
-        batch_size = len(examples)
-        label = torch.zeros(batch_size, batch_size * (1 + num_negatives))
-
-        for j in range(batch_size):
-            all_pos_premises_names = {p.full_name for p in examples[j]["all_pos_premises"]}
-            for k in range(batch_size * (1 + num_negatives)):
-                if k < batch_size:
-                    p_name_k = examples[k]["pos_premise"].full_name
-                else:
-                    p_name_k = examples[k % batch_size]["neg_premises"][
-                        k // batch_size - 1
-                    ].full_name
-                label[j, k] = float(p_name_k in all_pos_premises_names)
-
-        batch["label"] = label
     return batch
 
 
@@ -184,8 +194,31 @@ class GNNDataModule(pl.LightningDataModule):
                 is_train=True,
                 graph_dependencies_config=self.graph_dependencies_config,
                 negative_mining_strategy=self.negative_mining_strategy,
-            )        
-    
+            )
+
+        if stage in (None, "fit", "validate"):
+            self.ds_val = RetrievalDataset(
+                [os.path.join(self.data_path, "val.json")],
+                self.corpus,
+                0, 0, 0, None,
+                is_train=False,
+                graph_dependencies_config=self.graph_dependencies_config,
+                negative_mining_strategy=self.negative_mining_strategy,
+            )
+
+        if stage in (None, "test", "predict"):
+            self.ds_pred = RetrievalDataset(
+                [
+                    os.path.join(self.data_path, f"{split}.json")
+                    for split in ("train", "val", "test")
+                ],
+                self.corpus,
+                0, 0, 0, None,
+                is_train=False,
+                graph_dependencies_config=self.graph_dependencies_config,
+                negative_mining_strategy=self.negative_mining_strategy,
+            )
+     
     def _generate_and_cache_premise_embeddings(self) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         retriever = PremiseRetriever.load_hf(self.retriever_ckpt_path, 2048, device)
@@ -243,6 +276,7 @@ class GNNDataModule(pl.LightningDataModule):
             corpus=self.corpus,
             node_features=self.node_features,
             context_embeddings=self.context_embeddings,
+            is_train=True,
             num_negatives=self.num_negatives,
             negative_mining_strategy=self.negative_mining_strategy,
         )
@@ -255,4 +289,40 @@ class GNNDataModule(pl.LightningDataModule):
             pin_memory=True,
             drop_last=True,
             persistent_workers=True if self.num_workers > 0 else False,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        collate_fn_with_cache = functools.partial(
+            gnn_collate_fn,
+            corpus=self.corpus,
+            node_features=self.node_features,
+            context_embeddings=self.context_embeddings,
+            is_train=False,
+        )
+        return DataLoader(
+            self.ds_val,
+            batch_size=self.eval_batch_size,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn_with_cache,
+            shuffle=False,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    def predict_dataloader(self) -> DataLoader:
+        collate_fn_with_cache = functools.partial(
+            gnn_collate_fn,
+            corpus=self.corpus,
+            node_features=self.node_features,
+            context_embeddings=self.context_embeddings,
+            is_train=False,
+        )
+        return DataLoader(
+            self.ds_pred,
+            batch_size=self.eval_batch_size,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn_with_cache,
+            shuffle=False,
+            pin_memory=True,
+            drop_last=False,
         )
