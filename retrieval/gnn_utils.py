@@ -1,11 +1,18 @@
-from typing import List, Optional
+# retrieval/gnn_utils.py
+# MODIFIED: Added a line to `compute_ghost_node_embeddings_gated_rgcn` to store
+# the `last_gate_activation` tensor on the layer object. This allows for post-hoc
+# analysis and interpretation of the gate's behavior without altering the
+# function's return signature.
 
+from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
-from torch_geometric.nn import GCNConv, SAGEConv
-from torch_geometric.utils import add_remaining_self_loops, scatter
+from torch_geometric.nn import GCNConv, SAGEConv, RGCNConv, GATConv, RGATConv, GINConv, GINEConv
+from torch_geometric.utils import add_remaining_self_loops, scatter, softmax
+import torch.nn.functional as F
 
 from retrieval.gnn_modules.GatedRGCNConv import ResidualGatedRGCNConv as GatedRGCNConv
+
 
 def compute_ghost_node_embeddings_gcn(
     gcn_layer: GCNConv,
@@ -169,13 +176,6 @@ def compute_ghost_node_embeddings_graphsage(
         
     return out
 
-from typing import List, Optional, Tuple
-
-import torch
-from torch import Tensor
-from torch_geometric.nn import RGCNConv
-from torch_geometric.utils import scatter
-
 def compute_ghost_node_embeddings_rgcn(
     rgcn_layer: RGCNConv,
     existing_node_embs: Tensor,
@@ -321,15 +321,6 @@ def compute_ghost_node_embeddings_rgcn(
 
     return out
 
-from typing import List, Tuple
-import torch
-from torch import Tensor
-from torch_geometric.nn import GCNConv, RGCNConv, GATConv
-from torch_geometric.utils import add_self_loops, softmax, scatter
-# ... (your other two functions remain here) ...
-
-import torch.nn.functional as F
-
 def compute_ghost_node_embeddings_gat(
     gat_layer: GATConv,
     existing_node_embs: Tensor,
@@ -443,14 +434,6 @@ def compute_ghost_node_embeddings_gat(
         out = out + gat_layer.bias
 
     return out
-
-from typing import List, Tuple
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from torch_geometric.nn import GCNConv, RGCNConv, GATConv, RGATConv # Add RGATConv
-from torch_geometric.utils import softmax, scatter
-# ... (your other three functions remain here) ...
 
 def compute_ghost_node_embeddings_rgat(
     rgat_layer: RGATConv,
@@ -568,15 +551,6 @@ def compute_ghost_node_embeddings_rgat(
 
     return aggr_out
 
-from typing import List, Tuple, Callable
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-# Add GINConv and GINEConv to the import list
-from torch_geometric.nn import GCNConv, RGCNConv, GATConv, RGATConv, GINConv, GINEConv
-from torch_geometric.utils import softmax, scatter
-# ... (your other four functions remain here) ...
-
 def compute_ghost_node_embeddings_gin(
     gin_layer: GINConv,
     existing_node_embs: Tensor,
@@ -635,7 +609,6 @@ def compute_ghost_node_embeddings_gin(
 
     # --- 3. Apply the final MLP (`nn`) ---
     return gin_layer.nn(pre_mlp_embs)
-
 
 def compute_ghost_node_embeddings_gine(
     gine_layer: GINEConv,
@@ -709,6 +682,9 @@ def compute_ghost_node_embeddings_gated_rgcn(
     """
     Efficiently computes ghost node embeddings for a ResidualGatedRGCNConv layer.
     """
+    if not ghost_node_initial_embs:
+        return torch.empty(0, gated_rgcn_layer.out_channels, device=existing_node_embs.device)
+
     # GatedRGCNConv disables root weight and bias, so the rgcn util effectively
     # computes only the aggregated messages from neighbors.
     aggregated_messages = compute_ghost_node_embeddings_rgcn(
@@ -726,6 +702,12 @@ def compute_ghost_node_embeddings_gated_rgcn(
     # Apply the GRU-like gating mechanism from the layer
     combined = torch.cat([ghost_embs_tensor, aggregated_messages], dim=-1)
     update_gate = torch.sigmoid(gated_rgcn_layer.gate_nn(combined))
+
+    # --- MODIFICATION ---
+    # Store the gate activation tensor on the layer object for analysis.
+    gated_rgcn_layer.last_gate_activation = update_gate
+    # --- END OF MODIFICATION ---
+
     update_candidate = torch.tanh(gated_rgcn_layer.update_nn(combined))
     out = (1 - update_gate) * ghost_embs_tensor + update_gate * update_candidate
 
