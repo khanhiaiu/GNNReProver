@@ -60,12 +60,12 @@ export PYTHONWARNINGS="ignore"
 
 # Create a highly descriptive experiment name and log directory.
 EXP_NAME="${UNIQUE_NAME_TAG}_${NUM_LAYERS}layers_${SPLIT_TYPE}"
-LOG_DIR="lightning_logs/2025-09-09_${EXP_NAME}"
+LOG_DIR="lightning_logs/${EXP_NAME}"
 
 # Define paths based on the chosen split
 DATA_PATH="data/leandojo_benchmark_4/${SPLIT_TYPE}"
 CORPUS_PATH="data/leandojo_benchmark_4/corpus.jsonl"
-GNN_CONFIG="retrieval/confs/cli_gnn.yaml"
+GNN_CONFIG="retrieval/confs/cli_gnn_new.yaml"
 BASE_RETRIEVER="kaiyuy/leandojo-lean4-retriever-byt5-small"
 
 # Define paths for artifacts that will be generated
@@ -82,12 +82,12 @@ echo "W&B Run Name will be: $EXP_NAME"
 echo "Overriding GNN layers to: $NUM_LAYERS"
 echo "------------------------------------------------"
 
-#python retrieval/train_gnn.py fit \
-#    --config $GNN_CONFIG \
-#    --model.num_layers $NUM_LAYERS \
-#    --data.data_path "$DATA_PATH/" \
-#    --trainer.logger.name "$EXP_NAME" \
-#    --trainer.logger.save_dir "$LOG_DIR" 
+python retrieval/train_gnn.py fit \
+    --config $GNN_CONFIG \
+    --model.num_layers $NUM_LAYERS \
+    --data.data_path "$DATA_PATH/" \
+    --trainer.logger.name "$EXP_NAME" \
+    --trainer.logger.save_dir "$LOG_DIR" 
 
 # --- 4. Find Checkpoint and Saved Config ---
 echo "Training complete. Searching for artifacts..."
@@ -121,12 +121,12 @@ echo "Using saved training config from: $SAVED_CONFIG_PATH"
 echo "Using data from: $DATA_PATH"
 echo "Predictions will be saved to: $PREDICTIONS_PATH"
 
-#python retrieval/predict_dynamic.py \
-#    --config "$SAVED_CONFIG_PATH" \
-#    --retriever_ckpt_path "$BASE_RETRIEVER" \
-#    --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
-#    --data_path "$DATA_PATH" \
-#    --output_path "$PREDICTIONS_PATH"
+python retrieval/predict_dynamic_all.py \
+    --config "$SAVED_CONFIG_PATH" \
+    --retriever_ckpt_path "$BASE_RETRIEVER" \
+    --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \
+    --data_path "$DATA_PATH" \
+    --output_path "$PREDICTIONS_PATH"
 
 echo "Prediction complete."
 

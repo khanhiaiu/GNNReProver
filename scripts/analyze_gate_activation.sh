@@ -15,7 +15,7 @@ SAVED_CONFIG_PATH=$(find "$LOG_DIR" -name "config.yaml" -o -name "hparams.yaml" 
 # set cuda available devices to 1, 2
 export CUDA_VISIBLE_DEVICES=1,2
 
-python retrieval/analyze_gate_activations.py \
+CUDA_VISIBLE_DEVICES=1,2 python retrieval/analyze_gate_activations.py \
     --config "$SAVED_CONFIG_PATH" \
     --retriever_ckpt_path "$BASE_RETRIEVER" \
     --gnn_ckpt_path "$GNN_CHECKPOINT_PATH" \

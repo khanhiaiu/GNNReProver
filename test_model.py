@@ -131,7 +131,7 @@ def calculate_metrics(scores: torch.Tensor, gt_mask: torch.Tensor) -> float:
 
 class HeadAttentionScoring(nn.Module):
     # This class is unchanged
-    def __init__(self, embedding_dim: int, num_heads: int, aggregation: Literal["logsumexp", "mean", "max", "gated"], w_depth: int = 1):
+    def __init__(self, embedding_dim: int, num_heads: int, aggregation: Literal["logsumexp", "mean", "max", "gated", "cross"], w_depth: int = 1):
         super(HeadAttentionScoring, self).__init__()
         self.num_heads = num_heads
         self.embedding_dim = embedding_dim
@@ -214,6 +214,7 @@ class TestModel(Model, nn.Module):
         initial_context_embs = torch.zeros_like(batch_embeddings[n_premises:]).to(expected_dtype)
         initial_premise_emb_for_context = self.random_premise_embed_for_context.weight.to(expected_dtype)
         batch_embeddings_for_context = torch.cat([initial_premise_emb_for_context, initial_context_embs], dim=0)
+        #import code; code.interact(local=dict(globals(), **locals()))
         refined_context_embs = self.rgcn(batch_embeddings_for_context, batch_edge_index, batch_edge_attr)
         return initial_premise_embs, refined_context_embs[n_premises:]
 
@@ -254,6 +255,20 @@ class TestModel(Model, nn.Module):
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
 
+        # report the average logits of false positives and false negatives
+        with torch.no_grad():
+            if n_positive > 0:
+                false_negatives = (targets_tensor == 1) & (logits_tensor < 0)
+                print("False Negatives logits:", false_negatives.mean().item())
+            else:
+                print("No positive samples in this batch.")
+            
+            if n_negative > 0:
+                false_positives = (targets_tensor == 0) & (logits_tensor > 0)
+                print("False Positives logits:", false_positives.mean().item())
+            else:
+                print("No negative samples in this batch.")
+
         return weighted_loss, metrics
 
     def overfit_single_batch(
@@ -281,104 +296,131 @@ class TestModel(Model, nn.Module):
                 self.scheduler.step(interval_loss / scheduler_step_interval)
                 interval_loss = 0.0
 
-# ==============================================================================
-# ===== NEW CODE FOR HYPERPARAMETER SEARCH (USING overfit_single_batch) ======
-# ==============================================================================
-
-# --- Configuration for the Hyperparameter Search ---
-GPUS_TO_USE = [1, 2] # Your available GPU indices
-N_TOTAL_TRIALS = 50   # Total number of combinations to test
-OVERFIT_STEPS = 2000  # Number of steps to overfit on the single batch
-SCHEDULER_INTERVAL = 10
-BATCH_SIZE = 1024
-DB_FILENAME = "overfitting_aggregation_search.db"
-STUDY_NAME = "rgcn_overfitting_aggregation_search"
-
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-def run_experiment(trial, device):
-    """
-    Runs a single experiment: overfits on one batch and evaluates on that same batch.
-    """
-    params = {
-        'hidden_dim': trial.suggest_categorical("hidden_dim", [2048]),
-        'lr': trial.suggest_categorical("lr", [1e-2]),
-        'loss': trial.suggest_categorical("loss", ["bce"]),
-        'w_depth': trial.suggest_categorical("w_depth", [2]),
-        'use_scheduler': trial.suggest_categorical("use_scheduler", [False]),
-        'aggregation': trial.suggest_categorical("aggregation", ["mean", "gated", "logsumexp", "max"]),
-    }
-
+# Regular manual run:
+if __name__ == "__main__":
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     dataset = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
     dataset.to(device)
 
     model = TestModel(
         dataset=dataset,
-        hidden_dim=params['hidden_dim'], lr=params['lr'], aggregation=params['aggregation'], n_heads=8,
-        w_depth=params['w_depth'], loss=params['loss'], use_scheduler=params['use_scheduler']
+        hidden_dim=512, lr=1e-2, aggregation="max", n_heads=8,
+        w_depth=2, loss="bce", use_scheduler=False
     )
     model.to(device)
 
-    # Get the first batch of training data
     train_indices = dataset.train_mask.nonzero(as_tuple=True)[0]
-    train_generator = batchify_contexts(dataset, train_indices, BATCH_SIZE)
+    train_generator = batchify_contexts(dataset, train_indices, batch_size=32)
     first_batch = next(iter(train_generator), None)
     if first_batch is None:
-        print("No training data available. Skipping trial.")
-        return 0.0
-    
-    # Run the overfitting process on this single batch
-    print(f"Trial {trial.number}: Overfitting with params {params} on {device}")
-    model.overfit_single_batch(first_batch, OVERFIT_STEPS, SCHEDULER_INTERVAL)
+        print("No training data available.")
+        sys.exit(1)
 
-    # After overfitting, evaluate performance on that same batch
-    print(f"Trial {trial.number}: Final evaluation on the overfitted batch...")
+    print("Overfitting on a single batch...")
+    model.overfit_single_batch(first_batch, num_steps=2000, scheduler_step_interval=10)
+
+    print("Final evaluation on the overfitted batch...")
     final_metrics = model.eval_batch(*first_batch, dataset)
-    train_r_at_1 = final_metrics.get('R@1', 0.0)
-    
-    print(f"Trial {trial.number} finished. Final Overfitted Batch R@1: {train_r_at_1:.4f}")
-    return train_r_at_1
+    print(f"Final Overfitted Batch Metrics: {final_metrics}")
 
+# ==============================================================================
+# ===== NEW CODE FOR HYPERPARAMETER SEARCH (USING overfit_single_batch) ======
+# ==============================================================================
 
-def objective(trial, gpu_id):
-    device = torch.device(f"cuda:{gpu_id}")
-    try:
-        return run_experiment(trial, device)
-    except Exception as e:
-        print(f"!!! Trial {trial.number} failed with error on {device}: {e}")
-        return 0.0
-
-def run_worker(gpu_id):
-    print(f"Worker started for GPU {gpu_id}")
-    study = optuna.load_study(study_name=STUDY_NAME, storage=f"sqlite:///{DB_FILENAME}")
-    
-    n_workers = len(GPUS_TO_USE)
-    n_trials_per_worker = N_TOTAL_TRIALS // n_workers
-    if gpu_id == GPUS_TO_USE[-1]: n_trials_per_worker += N_TOTAL_TRIALS % n_workers
-
-    study.optimize(lambda trial: objective(trial, gpu_id), n_trials=n_trials_per_worker)
-    print(f"Worker for GPU {gpu_id} finished.")
-
-if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
-
-    study = optuna.create_study(
-        study_name=STUDY_NAME, storage=f"sqlite:///{DB_FILENAME}",
-        direction="maximize", load_if_exists=True
-    )
-
-    print(f"Starting hyperparameter search with {N_TOTAL_TRIALS} trials across GPUs: {GPUS_TO_USE}.")
-    print(f"Objective: Find params that maximize R@1 on a single batch after {OVERFIT_STEPS} steps.")
-    print(f"To view progress, run: optuna-dashboard sqlite:///{DB_FILENAME}")
-    
-    with multiprocessing.Pool(processes=len(GPUS_TO_USE)) as pool:
-        pool.map(run_worker, GPUS_TO_USE)
-
-    print("\n--- Hyperparameter Search for Overfitting Finished ---")
-    print(f"Number of finished trials: {len(study.trials)}")
-    print("\n--- Best Trial for Overfitting ---")
-    best_trial = study.best_trial
-    print(f"  Value (Overfitted Batch R@1): {best_trial.value:.6f}")
-    print("  Params: ")
-    for key, value in best_trial.params.items():
-        print(f"    {key}: {value}")
+## --- Configuration for the Hyperparameter Search ---
+#GPUS_TO_USE = [1, 2] # Your available GPU indices
+#N_TOTAL_TRIALS = 50   # Total number of combinations to test
+#OVERFIT_STEPS = 2000  # Number of steps to overfit on the single batch
+#SCHEDULER_INTERVAL = 10
+#BATCH_SIZE = 1024
+#DB_FILENAME = "overfitting_aggregation_search.db"
+#STUDY_NAME = "rgcn_overfitting_aggregation_search"
+#
+#optuna.logging.set_verbosity(optuna.logging.WARNING)
+#
+#def run_experiment(trial, device):
+#    """
+#    Runs a single experiment: overfits on one batch and evaluates on that same batch.
+#    """
+#    params = {
+#        'hidden_dim': trial.suggest_categorical("hidden_dim", [2048]),
+#        'lr': trial.suggest_categorical("lr", [1e-2]),
+#        'loss': trial.suggest_categorical("loss", ["bce"]),
+#        'w_depth': trial.suggest_categorical("w_depth", [2]),
+#        'use_scheduler': trial.suggest_categorical("use_scheduler", [False]),
+#        'aggregation': trial.suggest_categorical("aggregation", ["mean", "gated", "logsumexp", "max"]),
+#    }
+#
+#    dataset = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
+#    dataset.to(device)
+#
+#    model = TestModel(
+#        dataset=dataset,
+#        hidden_dim=params['hidden_dim'], lr=params['lr'], aggregation=params['aggregation'], n_heads=8,
+#        w_depth=params['w_depth'], loss=params['loss'], use_scheduler=params['use_scheduler']
+#    )
+#    model.to(device)
+#
+#    # Get the first batch of training data
+#    train_indices = dataset.train_mask.nonzero(as_tuple=True)[0]
+#    train_generator = batchify_contexts(dataset, train_indices, BATCH_SIZE)
+#    first_batch = next(iter(train_generator), None)
+#    if first_batch is None:
+#        print("No training data available. Skipping trial.")
+#        return 0.0
+#    
+#    # Run the overfitting process on this single batch
+#    print(f"Trial {trial.number}: Overfitting with params {params} on {device}")
+#    model.overfit_single_batch(first_batch, OVERFIT_STEPS, SCHEDULER_INTERVAL)
+#
+#    # After overfitting, evaluate performance on that same batch
+#    print(f"Trial {trial.number}: Final evaluation on the overfitted batch...")
+#    final_metrics = model.eval_batch(*first_batch, dataset)
+#    train_r_at_1 = final_metrics.get('R@1', 0.0)
+#    
+#    print(f"Trial {trial.number} finished. Final Overfitted Batch R@1: {train_r_at_1:.4f}")
+#    return train_r_at_1
+#
+#
+##def objective(trial, gpu_id):
+##    device = torch.device(f"cuda:{gpu_id}")
+##    try:
+##        return run_experiment(trial, device)
+##    except Exception as e:
+##        print(f"!!! Trial {trial.number} failed with error on {device}: {e}")
+##        return 0.0
+#
+##def run_worker(gpu_id):
+##    print(f"Worker started for GPU {gpu_id}")
+##    study = optuna.load_study(study_name=STUDY_NAME, storage=f"sqlite:///{DB_FILENAME}")
+##    
+##    n_workers = len(GPUS_TO_USE)
+##    n_trials_per_worker = N_TOTAL_TRIALS // n_workers
+##    if gpu_id == GPUS_TO_USE[-1]: n_trials_per_worker += N_TOTAL_TRIALS % n_workers
+##
+##    study.optimize(lambda trial: objective(trial, gpu_id), n_trials=n_trials_per_worker)
+##    print(f"Worker for GPU {gpu_id} finished.")
+#
+#if __name__ == "__main__":
+#    multiprocessing.set_start_method("spawn", force=True)
+#
+#    study = optuna.create_study(
+#        study_name=STUDY_NAME, storage=f"sqlite:///{DB_FILENAME}",
+#        direction="maximize", load_if_exists=True
+#    )
+#
+#    print(f"Starting hyperparameter search with {N_TOTAL_TRIALS} trials across GPUs: {GPUS_TO_USE}.")
+#    print(f"Objective: Find params that maximize R@1 on a single batch after {OVERFIT_STEPS} steps.")
+#    print(f"To view progress, run: optuna-dashboard sqlite:///{DB_FILENAME}")
+#    
+#    with multiprocessing.Pool(processes=len(GPUS_TO_USE)) as pool:
+#        pool.map(run_worker, GPUS_TO_USE)
+#
+#    print("\n--- Hyperparameter Search for Overfitting Finished ---")
+#    print(f"Number of finished trials: {len(study.trials)}")
+#    print("\n--- Best Trial for Overfitting ---")
+#    best_trial = study.best_trial
+#    print(f"  Value (Overfitted Batch R@1): {best_trial.value:.6f}")
+#    print("  Params: ")
+#    for key, value in best_trial.params.items():
+#        print(f"    {key}: {value}")

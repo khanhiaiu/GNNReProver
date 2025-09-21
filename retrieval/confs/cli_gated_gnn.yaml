@@ -22,7 +22,7 @@ trainer:
   log_every_n_steps: 5     # Solves the logging issue by logging at every optimizer step
 
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 3
+  accumulate_grad_batches: 12
   max_steps: 200000
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
@@ -42,7 +42,7 @@ trainer:
 model:
   feature_size: 1472
   num_layers: 2
-  lr: 1e-6
+  lr: 3e-6
   warmup_steps: 0
   loss_function: mse
   l1_lambda: 0.0 # Standard L1 regularization
@@ -59,13 +59,15 @@ model:
   use_initial_projection: false # Required since feature_size != hidden_size
   postprocess_gnn_embeddings: gnn # Use only GNN output as requested
 
+  separate_gnn_for_context: true
+
 data:
   data_path: data/leandojo_benchmark_4/random/
   corpus_path: data/leandojo_benchmark_4/corpus.jsonl
   retriever_ckpt_path: kaiyuy/leandojo-lean4-retriever-byt5-small
 
   # Note: The effective batch size is now 2048 * 2 * 3 = 12,288
-  batch_size: 2048 
+  batch_size: 1024 
   eval_batch_size: 4
   num_workers: 6
 

@@ -106,18 +106,24 @@ def main() -> None:
     )
     # This caches premise and all context embeddings.
     datamodule.setup(stage='predict') 
+    
+    # Clear any cached memory after setup
+    torch.cuda.empty_cache() 
 
     # Use a mock trainer to leverage on_predict_start for embedding setup
     mock_trainer = pl.Trainer(accelerator="auto", devices=1, logger=False)
     mock_trainer.datamodule = datamodule
     retriever.trainer = mock_trainer
     retriever.on_predict_start()
+    
+    # Clear memory after corpus re-indexing
+    torch.cuda.empty_cache()
 
     analyzer_module = GateAnalyzer(retriever)
     
     trainer = pl.Trainer(
         accelerator="auto",
-        devices="auto", # Automatically use available GPUs
+        devices=1, # Use only 1 GPU to avoid memory issues during corpus re-indexing
         logger=False,
     )
     

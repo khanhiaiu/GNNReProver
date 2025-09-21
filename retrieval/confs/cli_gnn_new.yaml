@@ -17,7 +17,7 @@ trainer:
       name: lm_dropout_restored_version   # from old config
       save_dir: lightning_logs/2025-09-08_lm_dropout_rgcn1_1layers_random
   gradient_clip_val: 1.0
-  max_steps: 20000
+  max_steps: 10000
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
       init_args:
@@ -31,20 +31,18 @@ model:
   feature_size: 1472
   num_layers: 1               # overridden from old config
   lr: 1e-4
-  warmup_steps: 100
-  loss_function: cross_entropy
+  warmup_steps: 0
+  loss_function: mse
   l1_lambda: 0.0
   weight_decay: 5e-4
-  edge_type_to_id:
-    signature_goal: 0
-    signature_lctx: 1
+  edge_type_to_id: {}
   
   # --- GNN Architecture ---
   gnn_layer_type: rgcn
   num_relations: 3
   hidden_size: 2048            # overridden from old config
   use_residual: true
-  dropout_p: 0.6              # overridden from old config
+  dropout_p: 0.2              # overridden from old config
   edge_dropout_p: 0.1
   norm_type: layer
   use_initial_projection: true
