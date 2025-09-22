@@ -153,3 +153,5 @@ lightweight_graph/data/
 lightweight_graph/data_instances/
 lightweight_graph/data_novel_updated_instances/
 lightweight_graph/data_random_updated_instances/
+best_config.json
+best_model_from_optuna.pth
