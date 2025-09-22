@@ -165,3 +165,8 @@ retrieval/interpret_gnn.py
 retrieval/predict_dynamic.py
 retrieval/predict_static.py
 retrieval/visualize_gnn_embeddings.py
+lightweight_tests.ipynb
+lightweight_tests.py
+retrieval/confs/cli_gated_gnn.yaml
+retrieval/confs/cli_gnn_new.yaml
+retrieval/confs/cli_gnn.yaml
