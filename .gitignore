@@ -151,3 +151,5 @@ tests/test_gnn_utils.py
 lightweight_graph/dataOLD/
 lightweight_graph/data/
 lightweight_graph/data_instances/
+lightweight_graph/data_novel_updated_instances/
+lightweight_graph/data_random_updated_instances/
