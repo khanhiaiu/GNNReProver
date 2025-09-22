@@ -155,3 +155,13 @@ lightweight_graph/data_novel_updated_instances/
 lightweight_graph/data_random_updated_instances/
 best_config.json
 best_model_from_optuna.pth
+KGAT_test.ipynb
+naive_test.ipynb
+test_model.py
+thorough.py
+lightweight_graph/README.md
+retrieval/analyze_gate_activations.py
+retrieval/interpret_gnn.py
+retrieval/predict_dynamic.py
+retrieval/predict_static.py
+retrieval/visualize_gnn_embeddings.py
