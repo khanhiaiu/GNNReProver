@@ -30,6 +30,8 @@ def main() -> None:
     logger.info(f"  - Num Val Contexts:   {dataset.val_mask.sum().item()}")
     logger.info(f"  - Num Test Contexts:  {dataset.test_mask.sum().item()}")
     logger.info(f"  - Edge Types Map: {dataset.edge_types_map}")
+    logger.info(f"  - Premise Positions Shape: {dataset.premise_pos.shape}")
+    logger.info(f"  - Context Theorem Positions Shape: {dataset.context_theorem_pos.shape}")
     logger.info(f"  - File Graph Info:")
     logger.info(f"    - Num Files: {len(dataset.file_idx_to_path_map)}")
     logger.info(f"    - Premise-to-File Map Shape: {dataset.premise_to_file_idx_map.shape}")

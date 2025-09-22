@@ -4,26 +4,21 @@ from torch import Tensor
 from torch_geometric.nn import RGCNConv, RGATConv, GATConv, GCNConv # type: ignore
 from typing import Callable, Dict, Any, List, Literal, Tuple, Optional
 import json
+import copy
 
 from tqdm import tqdm
 
 from lightweight_graph.dataset import LightweightGraphDataset
 
-# New imports for loading Optuna results
+# New imports for running Optuna
 import optuna
+import os
 
-# NOTE: The original imports for running the search (mp, os, traceback) are no longer needed for this script.
+import multiprocessing as mp
 
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ==============================================================================
-# ===== ALL YOUR ORIGINAL CLASSES AND FUNCTIONS (UNCHANGED) ====================
-# ==============================================================================
-# Your provided code for plot_score_distributions, L2Norm, GNN, Scorer,
-# LossFunction, NegativeSampler, calculate_metrics_batch, batchify_dataset,
-# GNNRetrievalModel, and get_data_configs is assumed to be here.
-# For brevity, it is collapsed. I will paste it in full below.
 
 def plot_score_distributions(
     scores: Tensor,
@@ -379,6 +374,19 @@ def calculate_metrics_batch(all_premise_scores_batch: Tensor, batch_labels : Ten
     return metrics
 
 
+def edge_dropout(
+    edge_index: Tensor, edge_type: Tensor, p: float, training: bool = True
+) -> Tuple[Tensor, Tensor]:
+    """Randomly drops edges from the edge_index and edge_type."""
+    if p == 0.0 or not training:
+        return edge_index, edge_type
+    
+    keep_prob = 1 - p
+    mask = torch.rand(edge_index.size(1), device=edge_index.device) < keep_prob
+    
+    return edge_index[:, mask], edge_type[mask]
+
+
 def batchify_dataset(dataset: LightweightGraphDataset, split_indices: Tensor, batch_size: int):
     n_contexts = dataset.context_embeddings.shape[0]
 
@@ -395,6 +403,8 @@ def batchify_dataset(dataset: LightweightGraphDataset, split_indices: Tensor, ba
         batch_context_embeddings = dataset.context_embeddings[batch_global_indices]
         
         batch_context_file_indices = dataset.context_to_file_idx_map[batch_global_indices]
+        batch_context_theorem_pos = dataset.context_theorem_pos[batch_global_indices]
+        
         batch_edge_mask = torch.isin(premise_to_context_edge_index[1], batch_global_indices)
         batch_premise_to_context_edge_index_global = premise_to_context_edge_index[:, batch_edge_mask].clone()
         batch_premise_to_context_edge_type = premise_to_context_edge_type[batch_edge_mask]
@@ -408,11 +418,15 @@ def batchify_dataset(dataset: LightweightGraphDataset, split_indices: Tensor, ba
         data : Dict[str, Any] = {
             "context_embeddings": batch_context_embeddings.float(),
             "context_to_file_idx_map": batch_context_file_indices,
+            "context_theorem_pos": batch_context_theorem_pos,
             "premise_embeddings": dataset.premise_embeddings.float(),
+
             "premise_edge_index": dataset.premise_edge_index,
             "premise_edge_type": dataset.premise_edge_attr,
+
             "premise_to_context_edge_index": batch_premise_to_context_edge_index_global,
             "premise_to_context_edge_type": batch_premise_to_context_edge_type,
+
             "retrieved_labels" : retrieved_labels
         }
         yield data
@@ -472,28 +486,40 @@ class GNNRetrievalModel(torch.nn.Module):
         all_edge_index = torch.cat([premise_edge_index, premise_to_context_edge_index], dim=1)
         all_edge_type = torch.cat([premise_edge_type, premise_to_context_edge_type], dim=0)
         
+        edge_dropout_p = self.config['gnn'].get('edge_dropout', 0.0)
+
         if self.config["separate_premise_GNN"]:
+            premise_ei_train, premise_et_train = edge_dropout(
+                premise_edge_index, premise_edge_type, p=edge_dropout_p, training=self.training
+            )
+            all_ei_train, all_et_train = edge_dropout(
+                all_edge_index, all_edge_type, p=edge_dropout_p, training=self.training
+            )
+
             if self.use_random_embeddings:
-                premise_embeddings = self.premise_gnn(self.random_initial_premise_embeddings, premise_edge_index, premise_edge_type)
+                premise_embeddings = self.premise_gnn(self.random_initial_premise_embeddings, premise_ei_train, premise_et_train)
                 dummy_context_embeddings = torch.zeros(n_contexts, hidden_size, device=self.random_initial_premise_embeddings_for_context.device)
                 all_random_embeddings_for_context = torch.cat([self.random_initial_premise_embeddings_for_context, dummy_context_embeddings], dim=0)
-                all_embeddings_for_context = self.context_gnn(all_random_embeddings_for_context, all_edge_index, all_edge_type)
+                all_embeddings_for_context = self.context_gnn(all_random_embeddings_for_context, all_ei_train, all_et_train)
                 context_embeddings = all_embeddings_for_context[n_premises:]
             else:
-                premise_embeddings = self.premise_gnn(initial_premise_embeddings, premise_edge_index, premise_edge_type)
+                premise_embeddings = self.premise_gnn(initial_premise_embeddings, premise_ei_train, premise_et_train)
                 all_initial_embeddings_for_context = torch.cat([initial_premise_embeddings, initial_batch_context_embeddings], dim=0)
-                all_embeddings_for_context = self.context_gnn(all_initial_embeddings_for_context, all_edge_index, all_edge_type)
+                all_embeddings_for_context = self.context_gnn(all_initial_embeddings_for_context, all_ei_train, all_et_train)
                 context_embeddings = all_embeddings_for_context[n_premises:]
         else: # not separate_premise_GNN
+            all_ei_train, all_et_train = edge_dropout(
+                all_edge_index, all_edge_type, p=edge_dropout_p, training=self.training
+            )
             if self.use_random_embeddings:
                 dummy_context_embeddings = torch.zeros(n_contexts, hidden_size, device=self.random_initial_premise_embeddings.device)
                 all_random_embeddings = torch.cat([self.random_initial_premise_embeddings, dummy_context_embeddings], dim=0)
-                all_embeddings = self.context_gnn(all_random_embeddings, all_edge_index, all_edge_type)
+                all_embeddings = self.context_gnn(all_random_embeddings, all_ei_train, all_et_train)
                 premise_embeddings = all_embeddings[:n_premises]
                 context_embeddings = all_embeddings[n_premises:]
             else:
                 all_initial_embeddings = torch.cat([initial_premise_embeddings, initial_batch_context_embeddings], dim=0)
-                all_embeddings = self.context_gnn(all_initial_embeddings, all_edge_index, all_edge_type)
+                all_embeddings = self.context_gnn(all_initial_embeddings, all_ei_train, all_et_train)
                 premise_embeddings = all_embeddings[:n_premises]
                 context_embeddings = all_embeddings[n_premises:]
 
@@ -568,23 +594,27 @@ class GNNRetrievalModel(torch.nn.Module):
             device = scores.device
 
             batch_context_file_indices = batch_data["context_to_file_idx_map"]
+            batch_context_theorem_pos = batch_data["context_theorem_pos"]
             premise_to_file_idx_map = dataset.premise_to_file_idx_map
             file_dependency_edge_index = dataset.file_dependency_edge_index
+            premise_end_pos = dataset.premise_pos[:, 2:]
+
+            batch_same_file_mask = batch_context_file_indices.unsqueeze(1) == premise_to_file_idx_map.unsqueeze(0)
+
+            batch_before_pos_mask = (premise_end_pos.unsqueeze(0)[:, :, 0] < batch_context_theorem_pos.unsqueeze(1)[:, :, 0]) | \
+                                    ((premise_end_pos.unsqueeze(0)[:, :, 0] == batch_context_theorem_pos.unsqueeze(1)[:, :, 0]) & \
+                                     (premise_end_pos.unsqueeze(0)[:, :, 1] <= batch_context_theorem_pos.unsqueeze(1)[:, :, 1]))
             
-            in_file_mask = batch_context_file_indices.unsqueeze(1) == premise_to_file_idx_map.unsqueeze(0)
+            in_file_accessible_mask = batch_same_file_mask & batch_before_pos_mask
 
-            n_files : int = max(premise_to_file_idx_map.max().item(), file_dependency_edge_index.max().item()) + 1
-
+            n_files = len(dataset.file_idx_to_path_map)
             file_dependency_adj = torch.zeros((n_files, n_files), dtype=torch.bool, device=device)
             src, dst = file_dependency_edge_index
             file_dependency_adj[src, dst] = True
-
-            batch_dependency_matrix = file_dependency_adj[batch_context_file_indices]
-
-            imported_mask = batch_dependency_matrix[:, premise_to_file_idx_map]
             
-            accessible_mask = in_file_mask | imported_mask
-            
+            imported_mask = file_dependency_adj[batch_context_file_indices][:, premise_to_file_idx_map]
+
+            accessible_mask = in_file_accessible_mask | imported_mask
             scores.masked_fill_(~accessible_mask, -torch.inf)
             
             retrieved_labels = batch_data["retrieved_labels"]
@@ -630,54 +660,14 @@ def get_data_configs(dataset: LightweightGraphDataset) -> Dict[str, Any]:
     return data_config
 
 
-# ==============================================================================
-# ===== STEP 1: FUNCTION TO GET BEST PARAMETERS FROM OPTUNA DB ===============
-# ==============================================================================
-
-def load_best_params_from_study(db_path: str, study_name: str) -> Dict[str, Any]:
-    """
-    Loads an Optuna study from a SQLite database and returns the parameters
-    of the best trial.
-    """
-    print(f"Loading Optuna study '{study_name}' from '{db_path}'...")
-    storage = optuna.storages.RDBStorage(url=f"sqlite:///{db_path}")
-    try:
-        study = optuna.load_study(study_name=study_name, storage=storage)
-    except KeyError:
-        print(f"Error: Study '{study_name}' not found in '{db_path}'.")
-        # Optional: Print available study names
-        all_studies = optuna.get_all_study_summaries(storage=storage)
-        if all_studies:
-            print("Available studies are:")
-            for s in all_studies:
-                print(f"- {s.study_name}")
-        exit()
-        
-    best_trial = study.best_trial
-    print(f"Found best trial #{best_trial.number} with R@10 value: {best_trial.value:.6f}")
-    
-    return best_trial.params
-
-
-# ==============================================================================
-# ===== STEP 2: FUNCTION TO RECONSTRUCT THE FULL CONFIG ========================
-# ==============================================================================
-
 def create_config_from_params(params: Dict[str, Any], n_relations: int, data_config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reconstructs the full, nested configuration dictionary from the flat
-    parameter dictionary returned by Optuna.
-    """
-    # Recreate derived parameters (like gnn_hidden_size)
     gnn_hidden_size = params['gnn_head_dim'] * params['gnn_heads']
     
-    # Determine weigh_by_class based on loss function
     if params['loss_function'] == 'info_nce':
         weigh_by_class = False
     else:
-        weigh_by_class = params.get('weigh_by_class', False) # Default to False if not present
+        weigh_by_class = params.get('weigh_by_class', False)
 
-    # Reconstruct the nested config dictionary
     config = {
         'use_random_embeddings': params['use_random_embeddings'],
         'separate_premise_GNN': params['separate_premise_GNN'],
@@ -688,20 +678,19 @@ def create_config_from_params(params: Dict[str, Any], n_relations: int, data_con
             'n_relations': n_relations,
             'activation': params['activation'],
             'dropout': params['dropout'],
+            'edge_dropout': params.get('edge_dropout', 0.0),
             'residual': params['residual'],
             'normalization': params['normalization'],
             'heads': params['gnn_heads'],
         },
         'negative_sampler': {
-            # In your main training, you might want a different sampler
-            'sampler': 'all',  # Using 'all' for evaluation consistency
+            'sampler': params['sampler'],
             'scorer': {
                 'preprocess': {
                     'type': params['scorer_preprocess_type'],
-                    'depth': params.get('scorer_nn_depth', 1), # Use .get for optional params
+                    'depth': params.get('scorer_nn_depth', 1),
                 },
                 'heads': params['scorer_heads'],
-                # Handle potential missing 'scorer_aggregation' in older trials
                 'aggregation': params.get('scorer_aggregation', 'mean'), 
                 'embedding_dim': gnn_hidden_size,
             }
@@ -715,81 +704,179 @@ def create_config_from_params(params: Dict[str, Any], n_relations: int, data_con
             'lr': params['lr'],
             'weight_decay': params['weight_decay'],
         },
-        # Add training and evaluation configs for the "normal" run
         'training': {
             'batch_size': params['batch_size'],
             'gradient_accumulation_steps': 2
         },
         'evaluation': {
-            'batch_size': 2048, # Use a larger batch size for faster evaluation
+            'batch_size': 2048
         },
-        'plot_score_distributions': False # Enable plotting for the final model
     }
-    
-    print("\n--- Constructed Full Model Configuration ---")
-    print(json.dumps(config, indent=2))
-    print("------------------------------------------\n")
-    
     return config
 
-
 # ==============================================================================
-# ===== NEW MAIN BLOCK FOR NORMAL (NON-OPTUNA) TRAINING ========================
+# ===== OPTUNA SCRIPT FOR REGULARIZATION SEARCH ================================
 # ==============================================================================
 
-if __name__ == "__main__":
+FIXED_PARAMS = {
+    "use_random_embeddings": False, "separate_premise_GNN": True, "layer_type": "RGCN",
+    "n_layers": 2, "gnn_head_dim": 128, "gnn_heads": 8, "activation": "relu",
+    "residual": True, "normalization": "l2", "sampler": "all",
+    "scorer_preprocess_type": "cosine", "scorer_nn_depth": 1, "scorer_heads": 2,
+    "scorer_aggregation": "mean", "loss_function": "info_nce",
+    "temperature": 0.013777448539592157, "lr": 0.004997184962551209, "batch_size": 1024,
+}
+
+SAVE_DIR = "lightweight_graph/data_random_updated"
+N_EPOCHS_PER_TRIAL = 50 
+
+# These will be initialized within each worker process
+dataset: Optional[LightweightGraphDataset] = None
+data_config: Optional[Dict[str, Any]] = None
+N_RELATIONS: Optional[int] = None
+DEVICE: Optional[str] = None
+
+def objective(trial: optuna.Trial) -> float:
+    global data_config, N_RELATIONS, DEVICE # Access globals set by the worker
+    assert data_config is not None and N_RELATIONS is not None and DEVICE is not None
+
+    trial_params = FIXED_PARAMS.copy()
+    trial_params['dropout'] = trial.suggest_float("dropout", 1e-5, 0.5, log=True)
+    trial_params['weight_decay'] = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    trial_params['edge_dropout'] = trial.suggest_float("edge_dropout", 0.0, 0.3)
+    
+    config = create_config_from_params(trial_params, N_RELATIONS, data_config)
+    
+    pid = os.getpid()
+    print(f"\n--- [PID {pid}] Starting Trial {trial.number} ---")
+    print(f"  [PID {pid}] Dropout: {config['gnn']['dropout']:.6f}, Weight Decay: {config['optimizer']['weight_decay']:.6f}, Edge Dropout: {config['gnn']['edge_dropout']:.6f}")
+    
     torch.manual_seed(42)
-
-    # --- Configuration ---
-    DB_PATH = "optuna_overfit_study_r10.db"
-    STUDY_NAME = "memorization-search-r10-v1"
-    SAVE_DIR = "lightweight_graph/data"
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    N_EPOCHS = 100
+    model = GNNRetrievalModel(config=config, data_config=data_config).to(DEVICE)
     
-    print(f"Using device: {DEVICE}")
+    best_trial_score = -1.0
+    
+    for epoch in range(1, N_EPOCHS_PER_TRIAL + 1):
+        model.train_epoch(dataset, config=config['training'])
+        val_metrics = model.evaluate(dataset, 'val', batch_size=config['evaluation']['batch_size'])
+        validation_score = val_metrics.get("R@10", 0.0)
+        best_trial_score = max(best_trial_score, validation_score)
+        
+        trial.report(validation_score, epoch)
+        
+        print(f"  [PID {pid}] Epoch {epoch}/{N_EPOCHS_PER_TRIAL} - Val R@10: {validation_score:.4f}")
 
-    # --- 1. Get the parameters of the best trial ---
-    best_params = load_best_params_from_study(DB_PATH, STUDY_NAME)
+        if trial.should_prune():
+            print(f"[PID {pid}] Trial {trial.number} pruned at epoch {epoch}.")
+            raise optuna.exceptions.TrialPruned()
 
-    # --- Setup Data and Model ---
-    print("Loading dataset...")
+    print(f"--- [PID {pid}] Trial {trial.number} finished. Best Val R@10: {best_trial_score:.4f} ---")
+    return best_trial_score
+
+
+def run_worker(gpu_id: int, study_name: str, db_path: str, n_trials_per_worker: int):
+    # Declare which global variables this worker will initialize
+    global dataset, data_config, N_RELATIONS, DEVICE
+    
+    # ===== MINIMAL CHANGE 2: SET THE DEVICE CORRECTLY =====
+    # Use torch.cuda.set_device() to select the GPU for this process.
+    # This must be done at the beginning of the worker function.
+    torch.cuda.set_device(gpu_id)
+    DEVICE = "cuda" # This will now correctly refer to the selected GPU
+    # ======================================================
+
+    # 2. Load dataset and configs *within this new process*
+    print(f"[Worker on GPU {gpu_id}, PID {os.getpid()}] Loading dataset...")
     dataset = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
-    dataset.to(DEVICE)
-    
     data_config = get_data_configs(dataset)
     
     max_premise_rel = dataset.premise_edge_attr.max().item() if dataset.premise_edge_attr.numel() > 0 else -1
     max_context_rel = dataset.context_edge_attr.max().item() if dataset.context_edge_attr.numel() > 0 else -1
-    n_relations = max(max_premise_rel, max_context_rel) + 1
-    print(f"Number of relations found in data: {n_relations}")
-
-    # --- 2. Create a complete config and run the model normally ---
-    best_config = create_config_from_params(best_params, n_relations, data_config)
+    N_RELATIONS = max(max_premise_rel, max_context_rel) + 1
+    print(f"[Worker on GPU {gpu_id}] Dataset loaded with {N_RELATIONS} relations. Moving to device '{DEVICE}'...")
     
-    model = GNNRetrievalModel(config=best_config, data_config=data_config).to(DEVICE)
+    dataset.to(DEVICE)
+    print(f"[Worker on GPU {gpu_id}] Dataset moved. Starting optimization.")
 
-    # --- Training and Evaluation Loop ---
-    for epoch in range(1, N_EPOCHS + 1):
-        print(f"\n===== EPOCH {epoch}/{N_EPOCHS} =====")
-        
-        # Train for one epoch
-        model.train_epoch(dataset, config=best_config['training'])
-        
-        # Evaluate on the validation set
-        val_metrics = model.evaluate(dataset, 'val', batch_size=best_config['evaluation']['batch_size'])
-        print(f"\nValidation metrics for Epoch {epoch}:")
-        for key, value in val_metrics.items():
-            print(f"  {key}: {value:.4f}")
-            
-    # --- Final Evaluation on Test Set ---
-    print("\n===== FINAL EVALUATION ON TEST SET =====")
-    test_metrics = model.evaluate(dataset, 'test', batch_size=best_config['evaluation']['batch_size'])
-    print("\nFinal Test Metrics:")
-    for key, value in test_metrics.items():
-        print(f"  {key}: {value:.4f}")
-        
-    # --- Save the final trained model ---
-    model_save_path = "best_model_from_optuna.pth"
-    torch.save(model.state_dict(), model_save_path)
-    print(f"\nModel state dictionary saved to '{model_save_path}'")
+    # 3. Connect to the shared Optuna study
+    storage = optuna.storages.RDBStorage(url=f"sqlite:///{db_path}")
+    study = optuna.load_study(study_name=study_name, storage=storage)
+
+    # 4. Run the optimization loop
+    study.optimize(objective, n_trials=n_trials_per_worker)
+    
+    print(f"[Worker on GPU {gpu_id}] Finished its assigned trials.")
+
+
+if __name__ == "__main__":
+    STUDY_NAME = "regularization-search-v3-with-edge-dropout"
+    DB_PATH = "optuna_regularization_study.db"
+    N_TRIALS = 50 
+
+    GPU_IDS = [0, 2, 3] 
+    N_JOBS = len(GPU_IDS)
+
+    # ===== MINIMAL CHANGE 1: SWITCH TO 'spawn' START METHOD =====
+    # Use the 'spawn' start method, which is required for CUDA safety.
+    # This creates a fresh process instead of forking.
+    try:
+        mp.set_start_method("spawn", force=True)
+        print("Using 'spawn' start method for CUDA compatibility.")
+    except RuntimeError:
+        print("Could not set 'spawn' start method. This may be due to the OS.")
+    # =============================================================
+
+    print(f"\nStarting Optuna study '{STUDY_NAME}' in parallel on {N_JOBS} GPUs: {GPU_IDS}")
+    print(f"Database will be saved to '{DB_PATH}'")
+    print(f"Running a total of {N_TRIALS} trials, each for up to {N_EPOCHS_PER_TRIAL} epochs.")
+
+    # Create the study object in the main process. This also creates the DB file.
+    storage = optuna.storages.RDBStorage(url=f"sqlite:///{DB_PATH}")
+    study = optuna.create_study(
+        study_name=STUDY_NAME,
+        storage=storage,
+        load_if_exists=True,
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5)
+    )
+
+    trials_per_worker = [N_TRIALS // N_JOBS] * N_JOBS
+    for i in range(N_TRIALS % N_JOBS):
+        trials_per_worker[i] += 1
+
+    processes = []
+    try:
+        for i in range(N_JOBS):
+            gpu_id = GPU_IDS[i]
+            n_worker_trials = trials_per_worker[i]
+            if n_worker_trials == 0:
+                continue
+
+            p = mp.Process(target=run_worker, args=(gpu_id, STUDY_NAME, DB_PATH, n_worker_trials))
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+    except KeyboardInterrupt:
+        print("\nStudy interrupted by user. Terminating worker processes...")
+        for p in processes:
+            p.terminate()
+            p.join()
+        print("Workers terminated. Results so far have been saved.")
+
+    print("\n===== Optuna Study Finished =====")
+    print(f"Study name: {study.study_name}")
+    study = optuna.load_study(study_name=STUDY_NAME, storage=storage)
+    print(f"Number of finished trials: {len(study.trials)}")
+    
+    try:
+        best_trial = study.best_trial
+        print("\n--- Best Trial ---")
+        print(f"  Value (Best R@10): {best_trial.value:.6f}")
+        print("  Parameters:")
+        for key, value in best_trial.params.items():
+            print(f"    {key}: {value}")
+    except ValueError:
+        print("No trials were completed. Cannot show best trial.")

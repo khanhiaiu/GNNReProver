@@ -10,28 +10,37 @@ from torch import LongTensor, FloatTensor
 
 class LightweightGraphDataset:
     """
-    A lightweight, fast-loading graph dataset container for GNN training.
-
-    This class holds the pre-processed graph data as simple torch Tensors,
-    avoiding complex data loading logic during training. The "context" nodes in
-    this dataset correspond to individual tactic instances, preserving duplicates
-    to match the original ReProver evaluation methodology.
+    Lightweight graph dataset for GNN training on formal theorem proving tasks.
+    
+    Dataset dimensions:
+        n_premises: Number of mathematical premises (theorems, definitions, lemmas)
+        n_contexts: Number of tactic instances (individual proof steps)
+        n_files: Number of source files in the corpus
+        embedding_dim: Dimension of node embeddings
 
     Attributes:
-        premise_embeddings (Tensor): Embeddings for all premises.
-        premise_edge_index (Tensor): Directed adjacency list for the premise graph.
-        premise_edge_attr (Tensor): Edge types for the premise graph.
-        context_embeddings (Tensor): Embeddings for all tactic instances.
-        context_edge_index (Tensor): Directed edges from premises to tactic instances.
-        context_edge_attr (Tensor): Edge types for the premise-to-instance edges.
-        context_premise_labels (Tensor): Ground-truth links from instances to correct answer premises.
-        train_mask, val_mask, test_mask (Tensor): Boolean masks for data splits, applied to instances.
-        premise_to_file_idx_map (Tensor): Maps a premise index to its file index.
-        context_to_file_idx_map (Tensor): Maps a tactic instance index to its file index.
-        file_dependency_edge_index (Tensor): Transitive import graph between files.
-        file_idx_to_path_map (List[str]): Maps a file index to its string path.
-        premise_idx_to_name_map (List[str]): Maps a premise index to its full name string.
-        edge_types_map (Dict[str, int]): Maps edge type names to integer IDs.
+        premise_embeddings (Tensor): ReProver embeddings for all premises. Shape: (n_premises, embedding_dim)
+        premise_edge_index (LongTensor): Directed adjacency list for the premise graph. Shape: (2, n_premise_edges)
+        premise_edge_attr (LongTensor): Edge types for the premise graph. Shape: (n_premise_edges,)
+        context_embeddings (Tensor): ReProver embeddings for all tactic instances. Shape: (n_contexts, embedding_dim)
+        context_edge_index (LongTensor): Directed edges from premises to tactic instances (bipartite graph). Shape: (2, n_context_edges)
+        context_edge_attr (LongTensor): Edge types for the premise-to-instance edges. Shape: (n_context_edges,)
+        context_premise_labels (LongTensor): Ground-truth links from instances to correct answer premises. Shape: (2, n_labels)
+        train_mask, val_mask, test_mask (Tensor): Boolean masks for data splits, applied to instances. Shape: (n_contexts,)
+        premise_pos (Tensor): Start and end positions for each premise [start_line, start_col, end_line, end_col]. Shape: (n_premises, 4)
+        context_theorem_pos (Tensor): Theorem position for each tactic instance [line, column]. Shape: (n_contexts, 2)
+        premise_to_file_idx_map (LongTensor): Maps premise index to its file index. Shape: (n_premises,)
+        context_to_file_idx_map (LongTensor): Maps tactic instance index to its file index. Shape: (n_contexts,)
+        file_dependency_edge_index (Tensor): Transitive import graph between files. Shape: (2, n_file_edges)
+        file_idx_to_path_map (List[str]): Maps file index to its string path. Length: n_files
+        premise_idx_to_name_map (List[str]): Maps premise index to its full name string. Length: n_premises
+        edge_types_map (Dict[str, int]): Maps edge type names to integer IDs (e.g., 'signature_lctx', 'signature_goal')
+        
+    Notes:
+        - All edge indices follow PyTorch Geometric format: source nodes in row 0, target nodes in row 1
+        - Premise and context nodes are separately indexed starting from 0
+        - Labels tensor format: [context_indices, premise_indices] for positive premise retrieval
+        - File paths are sorted alphabetically for consistent indexing
     """
 
     def __init__(
@@ -50,6 +59,8 @@ class LightweightGraphDataset:
         file_idx_to_path_map: List[str],
         premise_idx_to_name_map: List[str],
         edge_types_map: Dict[str, int],
+        premise_pos: Tensor,
+        context_theorem_pos: Tensor,
     ):
         self.premise_embeddings = premise_embeddings
         self.premise_edge_index = premise_edge_index
@@ -65,6 +76,8 @@ class LightweightGraphDataset:
         self.file_idx_to_path_map = file_idx_to_path_map
         self.premise_idx_to_name_map = premise_idx_to_name_map
         self.edge_types_map = edge_types_map
+        self.premise_pos = premise_pos
+        self.context_theorem_pos = context_theorem_pos
 
     def to(self, device: torch.device) -> "LightweightGraphDataset":
         """Moves all tensor attributes to the specified device."""
@@ -95,7 +108,8 @@ class LightweightGraphDataset:
             "context_premise_labels.pt", "train_mask.pt", "val_mask.pt", "test_mask.pt",
             "premise_to_file_idx_map.pt", "context_to_file_idx_map.pt",
             "file_dependency_edge_index.pt", "file_idx_to_path_map.pt",
-            "premise_idx_to_name_map.pt", "edge_types_map.pt",
+            "premise_idx_to_name_map.pt", "edge_types_map.pt", "premise_pos.pt",
+            "context_theorem_pos.pt",
         }
 
         if all(os.path.exists(os.path.join(instance_save_dir, fn)) for fn in filenames):
@@ -113,12 +127,11 @@ class LightweightGraphDataset:
     def _create_from_source(
         data_path: str, corpus_path: str, retriever_ckpt_path: str, gnn_config: Dict[str, Any], save_dir: str
     ) -> Dict[str, Any]:
-        # This import is only used for the one-time data creation process.
         from retrieval.gnn_datamodule import GNNDataModule, RetrievalDataset
         logger.info("Instantiating GNNDataModule to process source data...")
         datamodule = GNNDataModule(
             data_path=data_path, corpus_path=corpus_path, retriever_ckpt_path=retriever_ckpt_path,
-            batch_size=128, eval_batch_size=128, num_workers=4,
+            batch_size=4, eval_batch_size=4, num_workers=4,
             graph_dependencies_config=gnn_config,
             attributes={}, negative_mining={"strategy" : "random", "num_negatives": 0, "num_in_file_negatives": 0}
         )
@@ -133,6 +146,8 @@ class LightweightGraphDataset:
         premise_edge_index = corpus.premise_dep_graph.edge_index.clone()
         premise_edge_attr = corpus.premise_dep_graph.edge_attr.clone()
         premise_idx_to_name_map = [p.full_name for p in corpus.all_premises]
+        premise_pos_data = [[p.start.line_nb, p.start.column_nb, p.end.line_nb, p.end.column_nb] for p in corpus.all_premises]
+        premise_pos = torch.tensor(premise_pos_data, dtype=torch.long)
         edge_types_map = corpus.edge_types_map
 
         file_paths = sorted(list(corpus.transitive_dep_graph.nodes()))
@@ -147,6 +162,7 @@ class LightweightGraphDataset:
         context_embeddings_dtype = next(iter(datamodule.context_embeddings.values())).dtype
         context_embeddings = torch.zeros((num_instances, embedding_dim), dtype=context_embeddings_dtype)
         context_to_file_idx_map = torch.full((num_instances,), -1, dtype=torch.long)
+        context_theorem_pos = torch.full((num_instances, 2), -1, dtype=torch.long)
 
         # For edges and labels
         src_edges, dst_edges, attr_edges = [], [], []
@@ -159,8 +175,9 @@ class LightweightGraphDataset:
             context_str = ex["context"].serialize()
             context_embeddings[i] = datamodule.context_embeddings[context_str]
 
-            # 2. Map this instance to its file index
+            # 2. Map this instance to its file index and theorem position
             context_to_file_idx_map[i] = path_to_file_idx.get(ex["context"].path, -1)
+            context_theorem_pos[i] = torch.tensor((ex["context"].theorem_pos.line_nb, ex["context"].theorem_pos.column_nb), dtype=torch.long)
 
             # 3. Build context edges (p -> instance)
             for p_name in ex["lctx_premises"]:
@@ -185,14 +202,12 @@ class LightweightGraphDataset:
         # --- Masks ---
         logger.info("Building train/val/test masks for instances...")
         train_mask, val_mask, test_mask = (torch.zeros(num_instances, dtype=torch.bool) for _ in range(3))
-        # Create a unique key for each tactic instance to map it back
         instance_key_to_idx = {
             (ex["file_path"], ex["full_name"], tuple(ex["start"]), ex["tactic_idx"]): i
             for i, ex in enumerate(all_examples)
         }
 
         for split, mask in [("train", train_mask), ("val", val_mask), ("test", test_mask)]:
-            # We need to reload the split data to get the original list of examples for that split
             split_json_path = os.path.join(data_path, f"{split}.json")
             if os.path.exists(split_json_path):
                 split_ds = RetrievalDataset([split_json_path], corpus, 0, 0, 0, None, False, gnn_config)
@@ -211,6 +226,7 @@ class LightweightGraphDataset:
             "premise_to_file_idx_map": premise_to_file_idx_map, "context_to_file_idx_map": context_to_file_idx_map,
             "file_dependency_edge_index": file_dependency_edge_index, "file_idx_to_path_map": file_paths,
             "premise_idx_to_name_map": premise_idx_to_name_map, "edge_types_map": edge_types_map,
+            "premise_pos": premise_pos, "context_theorem_pos": context_theorem_pos,
         }
         for name, data in data_to_save.items():
             torch.save(data, os.path.join(save_dir, f"{name}.pt"))
