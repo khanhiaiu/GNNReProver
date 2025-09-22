@@ -714,9 +714,7 @@ def create_config_from_params(params: Dict[str, Any], n_relations: int, data_con
     }
     return config
 
-# ==============================================================================
 # ===== OPTUNA SCRIPT FOR REGULARIZATION SEARCH ================================
-# ==============================================================================
 
 FIXED_PARAMS = {
     "use_random_embeddings": False, "separate_premise_GNN": True, "layer_type": "RGCN",
@@ -725,7 +723,7 @@ FIXED_PARAMS = {
     "scorer_preprocess_type": "cosine", "scorer_nn_depth": 1, "scorer_heads": 2,
     "scorer_aggregation": "mean", "loss_function": "info_nce",
     "temperature": 0.013777448539592157, "lr": 0.004997184962551209, "batch_size": 1024,
-}
+} # NOTE: The parameters were automatically tuned
 
 SAVE_DIR = "lightweight_graph/data_random_updated"
 N_EPOCHS_PER_TRIAL = 50 
@@ -778,13 +776,11 @@ def run_worker(gpu_id: int, study_name: str, db_path: str, n_trials_per_worker: 
     # Declare which global variables this worker will initialize
     global dataset, data_config, N_RELATIONS, DEVICE
     
-    # ===== MINIMAL CHANGE 2: SET THE DEVICE CORRECTLY =====
     # Use torch.cuda.set_device() to select the GPU for this process.
     # This must be done at the beginning of the worker function.
     torch.cuda.set_device(gpu_id)
     DEVICE = "cuda" # This will now correctly refer to the selected GPU
-    # ======================================================
-
+    
     # 2. Load dataset and configs *within this new process*
     print(f"[Worker on GPU {gpu_id}, PID {os.getpid()}] Loading dataset...")
     dataset = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
