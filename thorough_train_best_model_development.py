@@ -21,6 +21,9 @@ import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# New import for EMA context manager
+from contextlib import contextmanager
+
 
 def plot_score_distributions(
     scores: Tensor,
@@ -97,6 +100,98 @@ def plot_score_distributions(
 
     plt.close(fig)
 
+
+# ==============================================================================
+# ===== NEW EMA IMPLEMENTATION =================================================
+# ==============================================================================
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+
+    This class maintains a shadow copy of a model's parameters, which are
+    updated using an exponential moving average of the trained parameters.
+    This can lead to better generalization and more stable models.
+
+    Usage:
+    >>> model = MyModel()
+    >>> optimizer = torch.optim.Adam(model.parameters())
+    >>> ema = EMA(model, decay=0.999)
+    >>>
+    >>> # In your training loop
+    >>> optimizer.step()
+    >>> ema.update()
+    >>>
+    >>> # For evaluation or saving the EMA model
+    >>> with ema.average_parameters():
+    ...     # All code in this block will use the shadow (averaged) parameters
+    ...     model.evaluate()
+    ...     torch.save(model.state_dict(), 'ema_model.pt')
+    >>> # Outside the block, the original parameters are restored.
+    """
+    def __init__(self, model: torch.nn.Module, decay: float):
+        if not (0.0 <= decay <= 1.0):
+            raise ValueError("Decay must be between 0 and 1.")
+        self.decay = decay
+        self.model = model
+        self.shadow_params = [p.clone().detach() for p in model.parameters() if p.requires_grad]
+        self.updates = 0
+        self.original_params: Optional[List[Tensor]] = None
+
+    def update(self) -> None:
+        """
+        Update the shadow parameters with the current model parameters.
+        Should be called after each optimizer.step().
+        """
+        self.updates += 1
+        with torch.no_grad():
+            for shadow_p, model_p in zip(self.shadow_params, self.model.parameters()):
+                if model_p.requires_grad:
+                    # The EMA update rule: shadow = decay * shadow + (1 - decay) * model
+                    # In-place version for efficiency: shadow -= (1 - decay) * (shadow - model)
+                    shadow_p.sub_((1.0 - self.decay) * (shadow_p - model_p))
+
+    def _apply_shadow(self) -> None:
+        """
+        Copies the shadow parameters into the model. This includes bias correction.
+        Bias correction is important early in training to counteract the fact that
+        the shadow parameters are initialized from the model's initial state.
+        """
+        # Bias correction factor
+        corrected_decay = 1.0 - (self.decay ** self.updates) if self.updates > 0 else 1.0
+        
+        self.original_params = [p.clone().detach() for p in self.model.parameters() if p.requires_grad]
+
+        with torch.no_grad():
+            for shadow_p, model_p in zip(self.shadow_params, self.model.parameters()):
+                if model_p.requires_grad:
+                    # Apply bias-corrected shadow weights to the model
+                    model_p.copy_(shadow_p / corrected_decay)
+
+    def _restore_original(self) -> None:
+        """Restores the original model parameters."""
+        if self.original_params is None:
+            return
+        with torch.no_grad():
+            for original_p, model_p in zip(self.original_params, self.model.parameters()):
+                if model_p.requires_grad:
+                    model_p.copy_(original_p)
+        self.original_params = None
+
+    @contextmanager
+    def average_parameters(self):
+        """
+        Context manager to temporarily use the shadow parameters.
+        Ensures original parameters are restored even if an error occurs.
+        """
+        self._apply_shadow()
+        try:
+            yield
+        finally:
+            self._restore_original()
+
+# ==============================================================================
+# ===== ORIGINAL MODEL AND HELPER CLASSES ======================================
+# ==============================================================================
 
 class L2Norm(torch.nn.Module):
     def __init__(self):
@@ -550,22 +645,7 @@ class GNNRetrievalModel(torch.nn.Module):
                 )
         return loss, metrics
 
-    def train_batch(self, batch_data: Dict[str, Any], should_updated: bool) -> Dict[str, Any]:
-        self.train()
-        
-        loss, batch_metrics_tensors = self.compute_loss(batch_data)
-        memory = torch.cuda.memory_allocated(device=loss.device) / (1024 ** 3)
-        loss.backward() # type: ignore
-        if should_updated:
-            self.optimizer.step() # type: ignore
-            self.optimizer.zero_grad()
-
-        batch_metrics = {k: v.mean().item() for k, v in batch_metrics_tensors.items()}
-        batch_metrics["loss"] = loss.item()
-        batch_metrics["memory"] = memory
-        return batch_metrics
-    
-    def train_epoch(self, dataset: LightweightGraphDataset, config: Dict[str, Any]) -> None:
+    def train_epoch(self, dataset: LightweightGraphDataset, config: Dict[str, Any], ema: Optional[EMA] = None) -> None:
         self.train()
         self.optimizer.zero_grad()
         gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
@@ -576,10 +656,24 @@ class GNNRetrievalModel(torch.nn.Module):
         num_batches = (len(train_split_indices) + config["batch_size"] - 1) // config["batch_size"]
         pbar = tqdm(enumerate(train_generator), total=num_batches, desc="Training")
 
-        all_batch_metrics : Dict[str, List[Any]] = {}
+        all_batch_metrics: Dict[str, List[Any]] = {}
         for i, batch_data in pbar:
             should_update = ((i + 1) % gradient_accumulation_steps == 0) or (i + 1 == num_batches)
-            batch_metrics = self.train_batch(batch_data, should_updated=should_update)
+            
+            loss, batch_metrics_tensors = self.compute_loss(batch_data)
+            memory = torch.cuda.memory_allocated(device=loss.device) / (1024 ** 3)
+            loss.backward() # type: ignore
+
+            if should_update:
+                self.optimizer.step()
+                if ema:
+                    ema.update()
+                self.optimizer.zero_grad()
+            
+            batch_metrics = {k: v.mean().item() for k, v in batch_metrics_tensors.items()}
+            batch_metrics["loss"] = loss.item()
+            batch_metrics["memory"] = memory
+
             for key, value in batch_metrics.items():
                 if key not in all_batch_metrics:
                     all_batch_metrics[key] = []
@@ -813,7 +907,7 @@ FIXED_PARAMS = {
 } # NOTE: The parameters were automatically tuned
 
 SAVE_DIR = "lightweight_graph/data_random_updated"
-N_EPOCHS_PER_TRIAL = 50 
+N_EPOCHS_PER_TRIAL = 120
 
 # These will be initialized within each worker process
 dataset: Optional[LightweightGraphDataset] = None
@@ -895,10 +989,14 @@ def train_ensemble_member_worker(
     gpu_id: int, 
     model_index: int, 
     config: Dict[str, Any], 
-    save_path: str
+    save_path: str,
+    use_ema: bool,
+    ema_decay: float
 ):
-    """Trains a single model for the ensemble on a specific GPU."""
-    # This setup is similar to the Optuna worker
+    """
+    Trains a single model for the ensemble on a specific GPU, saving the checkpoint
+    with the best validation score.
+    """
     torch.cuda.set_device(gpu_id)
     device = "cuda"
     
@@ -913,18 +1011,59 @@ def train_ensemble_member_worker(
     
     model = GNNRetrievalModel(config=config, data_config=data_config_member).to(device)
     
-    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Starting training...")
-    # Using the same number of epochs as one Optuna trial
-    for epoch in range(1, N_EPOCHS_PER_TRIAL + 1):
-        model.train_epoch(dataset_member, config=config['training'])
-        # Optional: You could add validation here and save the best model, but for simplicity, we train for a fixed number of epochs.
-        print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Epoch {epoch}/{N_EPOCHS_PER_TRIAL} complete.")
+    ema: Optional[EMA] = None
+    if use_ema:
+        ema = EMA(model, decay=ema_decay)
+        print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Using EMA with decay={ema_decay}")
+    
+    # --- Variables for tracking the best model states ---
+    best_val_score = -1.0
+    best_regular_state: Optional[Dict[str, Any]] = None
+    best_ema_state: Optional[Dict[str, Any]] = None
+    # ---
 
-    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Training finished. Saving model to {save_path}")
-    torch.save(model.state_dict(), save_path)
+    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Starting training...")
+    for epoch in range(1, N_EPOCHS_PER_TRIAL + 1):
+        # 1. Train for one epoch
+        model.train_epoch(dataset_member, config=config['training'], ema=ema)
+        
+        # 2. Evaluate the REGULAR model on the validation set
+        val_metrics = model.evaluate(dataset_member, 'val', batch_size=config['evaluation']['batch_size'])
+        current_val_score = val_metrics.get("R@10", 0.0) # Using R@10, same as Optuna
+        
+        print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Epoch {epoch}/{N_EPOCHS_PER_TRIAL} | Val R@10: {current_val_score:.4f}")
+
+        # 3. Check if this is the best model so far
+        if current_val_score > best_val_score:
+            best_val_score = current_val_score
+            print(f"  -> New best validation score: {best_val_score:.4f}. Caching model states.")
+            
+            # Cache the regular model's state
+            best_regular_state = copy.deepcopy(model.state_dict())
+            
+            # If using EMA, also cache the EMA-averaged weights from this same epoch
+            if ema:
+                with ema.average_parameters():
+                    best_ema_state = copy.deepcopy(model.state_dict())
+
+    # After the loop, save the BEST model states we found
+    if best_regular_state:
+        print(f"[Ensemble Trainer {model_index}] Saving best REGULAR model (Val R@10: {best_val_score:.4f}) to {save_path}")
+        torch.save(best_regular_state, save_path)
+    else:
+        print(f"[Ensemble Trainer {model_index}] Warning: No best regular model state was saved.")
+
+    if best_ema_state:
+        base, ext = os.path.splitext(save_path)
+        ema_save_path = f"{base}_ema{ext}"
+        print(f"[Ensemble Trainer {model_index}] Saving best EMA model (from same epoch) to {ema_save_path}")
+        torch.save(best_ema_state, ema_save_path)
+    elif use_ema:
+         print(f"[Ensemble Trainer {model_index}] Warning: No best EMA model state was saved.")
+
 
 # ==============================================================================
-# ===== NEW SCRIPT MODES AND HELPER FUNCTIONS ==================================
+# ===== SCRIPT MODES AND HELPER FUNCTIONS ======================================
 # ==============================================================================
 
 def load_best_config(args: argparse.Namespace, dataset: LightweightGraphDataset) -> Dict[str, Any]:
@@ -949,6 +1088,10 @@ def load_best_config(args: argparse.Namespace, dataset: LightweightGraphDataset)
     best_params.update(best_trial.params)
     
     final_config = create_config_from_params(best_params, n_relations, data_config)
+
+    print("\n--- Full Model Configuration Being Used ---")
+    print(json.dumps(final_config, indent=4))
+
     return final_config
 
 def run_hyperparameter_search(args: argparse.Namespace):
@@ -998,6 +1141,8 @@ def run_ensemble_training(args: argparse.Namespace):
     
     os.makedirs(args.ensemble_dir, exist_ok=True)
     print(f"\nTraining an ensemble of {args.n_ensemble} models using the best hyperparameters.")
+    if args.use_ema:
+        print(f"EMA is ENABLED with a decay of {args.ema_decay}.")
     print(f"Models will be saved in '{args.ensemble_dir}/'")
 
     n_jobs = len(args.gpu_ids)
@@ -1012,7 +1157,10 @@ def run_ensemble_training(args: argparse.Namespace):
         for model_idx_in_batch, model_idx_global in enumerate(batch_indices):
             gpu_id = args.gpu_ids[model_idx_in_batch]
             model_path = checkpoint_paths[model_idx_global]
-            p = mp.Process(target=train_ensemble_member_worker, args=(gpu_id, model_idx_global, final_config, model_path))
+            p = mp.Process(
+                target=train_ensemble_member_worker, 
+                args=(gpu_id, model_idx_global, final_config, model_path, args.use_ema, args.ema_decay)
+            )
             p.start()
             batch_processes.append(p)
         
@@ -1029,7 +1177,18 @@ def run_ensemble_evaluation(args: argparse.Namespace):
     dataset_main = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
     final_config = load_best_config(args, dataset_main)
     
-    all_checkpoint_paths = sorted([os.path.join(args.ensemble_dir, f) for f in os.listdir(args.ensemble_dir) if f.startswith('model_') and f.endswith('.pt')])
+    # Logic to select which model files to load
+    print(f"Searching for models in '{args.ensemble_dir}'...")
+    all_files = sorted([f for f in os.listdir(args.ensemble_dir) if f.startswith('model_') and f.endswith('.pt')])
+    
+    if args.model_type == 'ema':
+        print("Selecting EMA models for evaluation (files ending in '_ema.pt').")
+        model_files = [f for f in all_files if f.endswith('_ema.pt')]
+    else: # 'regular'
+        print("Selecting REGULAR models for evaluation (files NOT ending in '_ema.pt').")
+        model_files = [f for f in all_files if not f.endswith('_ema.pt')]
+        
+    all_checkpoint_paths = [os.path.join(args.ensemble_dir, f) for f in model_files]
     
     if args.exclude:
         print(f"Excluding model indices: {args.exclude}")
@@ -1038,7 +1197,7 @@ def run_ensemble_evaluation(args: argparse.Namespace):
         final_checkpoint_paths = all_checkpoint_paths
 
     if not final_checkpoint_paths:
-        print("No models found to evaluate. Exiting.")
+        print(f"No '{args.model_type}' models found to evaluate. Exiting.")
         return
 
     # Evaluation can be done on a single designated GPU
@@ -1058,7 +1217,7 @@ def run_ensemble_evaluation(args: argparse.Namespace):
         batch_size=final_config['evaluation']['batch_size']
     )
     
-    print(f"\n--- Final Ensemble Metrics on '{args.split}' split ---")
+    print(f"\n--- Final Ensemble Metrics for '{args.model_type.upper()}' models on '{args.split}' split ---")
     for key, value in metrics.items():
         print(f"  {key}: {value:.4f}")
     
@@ -1074,14 +1233,14 @@ if __name__ == "__main__":
     1. Perform Hyperparameter Search:
        python your_script_name.py --search --n-trials 50 --gpu-ids 0 2 3
     
-    2. Train the Final Ensemble using the best found parameters:
-       python your_script_name.py --train-ensemble --n-ensemble 6 --gpu-ids 0 2 3
+    2. Train the Final Ensemble using the best found parameters (with EMA):
+       python your_script_name.py --train-ensemble --n-ensemble 6 --gpu-ids 0 2 3 --use-ema
        
-    3. Evaluate the Trained Ensemble on the test set:
-       python your_script_name.py --evaluate-ensemble --gpu-ids 0
+    3. Evaluate the Trained Regular Ensemble on the test set:
+       python your_script_name.py --evaluate-ensemble --gpu-ids 0 --model-type regular
        
-    4. Evaluate, but exclude models 1 and 4 from the ensemble:
-       python your_script_name.py --evaluate-ensemble --gpu-ids 0 --exclude 1 4
+    4. Evaluate the Trained EMA Ensemble on the test set:
+       python your_script_name.py --evaluate-ensemble --gpu-ids 0 --model-type ema
     """
     parser = argparse.ArgumentParser(description="GNN Retrieval Model Training and Evaluation")
     
@@ -1091,20 +1250,23 @@ if __name__ == "__main__":
     parser.add_argument('--evaluate-ensemble', action='store_true', help='Evaluate a pre-trained ensemble of models.')
     
     # Common arguments
-    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0, 2, 3], help='List of GPU IDs to use.')
+    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0], help='List of GPU IDs to use.')
     parser.add_argument('--db-path', type=str, default="optuna_study.db", help='Path to the Optuna SQLite database.')
     parser.add_argument('--study-name', type=str, default="regularization-search", help='Name of the Optuna study.')
     parser.add_argument('--ensemble-dir', type=str, default="ensemble_models", help='Directory to save/load ensemble models.')
     
     # Search-specific arguments
-    parser.add_argument('--n-trials', type=int, default=50, help='Number of trials for Optuna search.')
+    parser.add_argument('--n-trials', type=int, default=300, help='Number of trials for Optuna search.')
     
     # Training-specific arguments
     parser.add_argument('--n-ensemble', type=int, default=6, help='Number of models in the ensemble.')
-    
+    parser.add_argument('--use-ema', action='store_true', help='Use Exponential Moving Average during ensemble training.')
+    parser.add_argument('--ema-decay', type=float, default=0.999, help='Decay rate for EMA.')
+
     # Evaluation-specific arguments
     parser.add_argument('--exclude', type=int, nargs='*', help='List of model indices to exclude from the ensemble during evaluation.')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'], help='Data split to evaluate on.')
+    parser.add_argument('--model-type', type=str, default='regular', choices=['regular', 'ema'], help='Which type of models to evaluate from the ensemble directory.')
 
     args = parser.parse_args()
     
