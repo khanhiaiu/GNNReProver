@@ -15,6 +15,8 @@ import optuna
 import os
 
 import multiprocessing as mp
+# New import for command-line arguments
+import argparse
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -590,7 +592,7 @@ class GNNRetrievalModel(torch.nn.Module):
         self.eval()
         with torch.no_grad():
             context_embeddings, premise_embeddings = self.forward(batch_data)
-            scores = self.scorer.forward(context_embeddings, premise_embeddings)
+            scores = self.scorer(context_embeddings, premise_embeddings)
             device = scores.device
 
             batch_context_file_indices = batch_data["context_to_file_idx_map"]
@@ -648,6 +650,91 @@ class GNNRetrievalModel(torch.nn.Module):
         for key, value in all_metrics_tensor.items():
             metrics[key] = value.mean().item()
 
+        return metrics
+
+
+class EnsembleGNNRetrievalModel(torch.nn.Module):
+    """A wrapper to handle evaluation for an ensemble of GNNRetrievalModels."""
+    def __init__(self, config: Dict[str, Any], data_config: Dict[str, Any], checkpoint_paths: List[str], device: str):
+        super().__init__()
+        self.models = torch.nn.ModuleList()
+        self.device = device
+        
+        print(f"Loading {len(checkpoint_paths)} models for the ensemble...")
+        for path in checkpoint_paths:
+            # Create a model instance with the same config
+            model = GNNRetrievalModel(config, data_config)
+            # Load the saved state dictionary
+            model.load_state_dict(torch.load(path, map_location=device))
+            model.to(device)
+            model.eval() # Set to evaluation mode
+            self.models.append(model)
+        print("Ensemble models loaded successfully.")
+
+    @torch.no_grad()
+    def evaluate_batch(self, batch_data: Dict[str, Any], dataset: LightweightGraphDataset) -> Dict[str, Tensor]:
+        all_scores = []
+        # Get scores from each model in the ensemble
+        for model in self.models:
+            # We only need the final scores, so we can call a simplified forward pass
+            context_embeddings, premise_embeddings = model.forward(batch_data)
+            scores = model.scorer(context_embeddings, premise_embeddings)
+            all_scores.append(scores)
+
+        # Average the scores across the ensemble
+        ensemble_scores = torch.stack(all_scores).mean(dim=0)
+
+        # The rest of this function is copied directly from GNNRetrievalModel.evaluate_batch
+        # to apply the accessibility mask to the final averaged scores.
+        device = ensemble_scores.device
+
+        batch_context_file_indices = batch_data["context_to_file_idx_map"]
+        batch_context_theorem_pos = batch_data["context_theorem_pos"]
+        premise_to_file_idx_map = dataset.premise_to_file_idx_map
+        file_dependency_edge_index = dataset.file_dependency_edge_index
+        premise_end_pos = dataset.premise_pos[:, 2:]
+
+        batch_same_file_mask = batch_context_file_indices.unsqueeze(1) == premise_to_file_idx_map.unsqueeze(0)
+        batch_before_pos_mask = (premise_end_pos.unsqueeze(0)[:, :, 0] < batch_context_theorem_pos.unsqueeze(1)[:, :, 0]) | \
+                                ((premise_end_pos.unsqueeze(0)[:, :, 0] == batch_context_theorem_pos.unsqueeze(1)[:, :, 0]) & \
+                                (premise_end_pos.unsqueeze(0)[:, :, 1] <= batch_context_theorem_pos.unsqueeze(1)[:, :, 1]))
+        in_file_accessible_mask = batch_same_file_mask & batch_before_pos_mask
+
+        n_files = len(dataset.file_idx_to_path_map)
+        file_dependency_adj = torch.zeros((n_files, n_files), dtype=torch.bool, device=device)
+        src, dst = file_dependency_edge_index
+        file_dependency_adj[src, dst] = True
+        imported_mask = file_dependency_adj[batch_context_file_indices][:, premise_to_file_idx_map]
+        
+        accessible_mask = in_file_accessible_mask | imported_mask
+        ensemble_scores.masked_fill_(~accessible_mask, -torch.inf)
+        
+        retrieved_labels = batch_data["retrieved_labels"]
+        metrics = calculate_metrics_batch(ensemble_scores, retrieved_labels)
+        return metrics
+
+    def evaluate(self, dataset: LightweightGraphDataset, split: str, batch_size: int) -> Dict[str, float]:
+        # This function is identical to GNNRetrievalModel.evaluate
+        self.eval()
+        with torch.no_grad():
+            mask = getattr(dataset, f"{split}_mask", None)
+            if mask is None: raise ValueError(f"Invalid split: {split}")
+            split_indices = mask.nonzero(as_tuple=False).view(-1)
+            
+            eval_generator = batchify_dataset(dataset, split_indices, batch_size)
+            metrics_data: list[Dict[str, Tensor]] = []
+            pbar = tqdm(eval_generator, desc=f"Evaluating Ensemble on {split} split")
+            for batch_data in pbar:
+                metrics_data.append(self.evaluate_batch(batch_data, dataset))
+            
+        all_metrics_lists: Dict[str, list[Tensor]] = {}
+        for m in metrics_data:
+            for key, value in m.items():
+                if key not in all_metrics_lists: all_metrics_lists[key] = []
+                all_metrics_lists[key].append(value)
+        
+        all_metrics_tensor = {key: torch.cat(value, dim=0) for key, value in all_metrics_lists.items()}
+        metrics = {key: value.mean().item() for key, value in all_metrics_tensor.items()}
         return metrics
 
 
@@ -804,75 +891,236 @@ def run_worker(gpu_id: int, study_name: str, db_path: str, n_trials_per_worker: 
     print(f"[Worker on GPU {gpu_id}] Finished its assigned trials.")
 
 
-if __name__ == "__main__":
-    STUDY_NAME = "regularization-search-v3-with-edge-dropout"
-    DB_PATH = "optuna_regularization_study.db"
-    N_TRIALS = 50 
+def train_ensemble_member_worker(
+    gpu_id: int, 
+    model_index: int, 
+    config: Dict[str, Any], 
+    save_path: str
+):
+    """Trains a single model for the ensemble on a specific GPU."""
+    # This setup is similar to the Optuna worker
+    torch.cuda.set_device(gpu_id)
+    device = "cuda"
+    
+    # Use a different seed for each model to ensure they are unique
+    torch.manual_seed(42 + model_index) 
+    
+    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}, PID {os.getpid()}] Loading dataset...")
+    # Load dataset and configs within the new process
+    dataset_member = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
+    dataset_member.to(device)
+    data_config_member = get_data_configs(dataset_member)
+    
+    model = GNNRetrievalModel(config=config, data_config=data_config_member).to(device)
+    
+    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Starting training...")
+    # Using the same number of epochs as one Optuna trial
+    for epoch in range(1, N_EPOCHS_PER_TRIAL + 1):
+        model.train_epoch(dataset_member, config=config['training'])
+        # Optional: You could add validation here and save the best model, but for simplicity, we train for a fixed number of epochs.
+        print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Epoch {epoch}/{N_EPOCHS_PER_TRIAL} complete.")
 
-    GPU_IDS = [0, 2, 3] 
-    N_JOBS = len(GPU_IDS)
+    print(f"[Ensemble Trainer {model_index} on GPU {gpu_id}] Training finished. Saving model to {save_path}")
+    torch.save(model.state_dict(), save_path)
 
-    # ===== MINIMAL CHANGE 1: SWITCH TO 'spawn' START METHOD =====
-    # Use the 'spawn' start method, which is required for CUDA safety.
-    # This creates a fresh process instead of forking.
-    try:
-        mp.set_start_method("spawn", force=True)
-        print("Using 'spawn' start method for CUDA compatibility.")
-    except RuntimeError:
-        print("Could not set 'spawn' start method. This may be due to the OS.")
-    # =============================================================
+# ==============================================================================
+# ===== NEW SCRIPT MODES AND HELPER FUNCTIONS ==================================
+# ==============================================================================
 
-    print(f"\nStarting Optuna study '{STUDY_NAME}' in parallel on {N_JOBS} GPUs: {GPU_IDS}")
-    print(f"Database will be saved to '{DB_PATH}'")
-    print(f"Running a total of {N_TRIALS} trials, each for up to {N_EPOCHS_PER_TRIAL} epochs.")
+def load_best_config(args: argparse.Namespace, dataset: LightweightGraphDataset) -> Dict[str, Any]:
+    """Loads the best trial from an Optuna study and creates a model config."""
+    print(f"Loading best trial from study '{args.study_name}' in '{args.db_path}'...")
+    storage = optuna.storages.RDBStorage(url=f"sqlite:///{args.db_path}")
+    study = optuna.load_study(study_name=args.study_name, storage=storage)
+    best_trial = study.best_trial
 
-    # Create the study object in the main process. This also creates the DB file.
-    storage = optuna.storages.RDBStorage(url=f"sqlite:///{DB_PATH}")
+    print("\n--- Best Trial ---")
+    print(f"  Value (Best R@10): {best_trial.value:.6f}")
+    print("  Parameters:")
+    for key, value in best_trial.params.items():
+        print(f"    {key}: {value}")
+    
+    data_config = get_data_configs(dataset)
+    max_premise_rel = dataset.premise_edge_attr.max().item() if dataset.premise_edge_attr.numel() > 0 else -1
+    max_context_rel = dataset.context_edge_attr.max().item() if dataset.context_edge_attr.numel() > 0 else -1
+    n_relations = max(max_premise_rel, max_context_rel) + 1
+    
+    best_params = FIXED_PARAMS.copy()
+    best_params.update(best_trial.params)
+    
+    final_config = create_config_from_params(best_params, n_relations, data_config)
+    return final_config
+
+def run_hyperparameter_search(args: argparse.Namespace):
+    """Executes the Optuna hyperparameter search."""
+    print(f"\nStarting Optuna study '{args.study_name}' in parallel on {len(args.gpu_ids)} GPUs: {args.gpu_ids}")
+    print(f"Database will be saved to '{args.db_path}'")
+    print(f"Running a total of {args.n_trials} trials, each for up to {N_EPOCHS_PER_TRIAL} epochs.")
+
+    storage = optuna.storages.RDBStorage(url=f"sqlite:///{args.db_path}")
     study = optuna.create_study(
-        study_name=STUDY_NAME,
+        study_name=args.study_name,
         storage=storage,
         load_if_exists=True,
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=5)
     )
 
-    trials_per_worker = [N_TRIALS // N_JOBS] * N_JOBS
-    for i in range(N_TRIALS % N_JOBS):
+    n_jobs = len(args.gpu_ids)
+    trials_per_worker = [args.n_trials // n_jobs] * n_jobs
+    for i in range(args.n_trials % n_jobs):
         trials_per_worker[i] += 1
 
     processes = []
     try:
-        for i in range(N_JOBS):
-            gpu_id = GPU_IDS[i]
+        for i in range(n_jobs):
+            gpu_id = args.gpu_ids[i]
             n_worker_trials = trials_per_worker[i]
-            if n_worker_trials == 0:
-                continue
-
-            p = mp.Process(target=run_worker, args=(gpu_id, STUDY_NAME, DB_PATH, n_worker_trials))
+            if n_worker_trials == 0: continue
+            p = mp.Process(target=run_worker, args=(gpu_id, args.study_name, args.db_path, n_worker_trials))
             p.start()
             processes.append(p)
-
-        for p in processes:
-            p.join()
-
+        for p in processes: p.join()
     except KeyboardInterrupt:
         print("\nStudy interrupted by user. Terminating worker processes...")
-        for p in processes:
-            p.terminate()
-            p.join()
+        for p in processes: p.terminate(); p.join()
         print("Workers terminated. Results so far have been saved.")
 
     print("\n===== Optuna Study Finished =====")
-    print(f"Study name: {study.study_name}")
-    study = optuna.load_study(study_name=STUDY_NAME, storage=storage)
-    print(f"Number of finished trials: {len(study.trials)}")
+
+
+def run_ensemble_training(args: argparse.Namespace):
+    """Trains N ensemble models using the best config from an Optuna study."""
+    print("\n===== Starting Final Ensemble Training =====")
     
+    dataset_main = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
+    final_config = load_best_config(args, dataset_main)
+    
+    os.makedirs(args.ensemble_dir, exist_ok=True)
+    print(f"\nTraining an ensemble of {args.n_ensemble} models using the best hyperparameters.")
+    print(f"Models will be saved in '{args.ensemble_dir}/'")
+
+    n_jobs = len(args.gpu_ids)
+    checkpoint_paths = [os.path.join(args.ensemble_dir, f"model_{i}.pt") for i in range(args.n_ensemble)]
+
+    # Iterate in chunks of size n_jobs to train one model per GPU at a time
+    for i in range(0, args.n_ensemble, n_jobs):
+        batch_processes = []
+        batch_indices = range(i, min(i + n_jobs, args.n_ensemble))
+        print(f"\n--- Starting training batch for models: {list(batch_indices)} ---")
+
+        for model_idx_in_batch, model_idx_global in enumerate(batch_indices):
+            gpu_id = args.gpu_ids[model_idx_in_batch]
+            model_path = checkpoint_paths[model_idx_global]
+            p = mp.Process(target=train_ensemble_member_worker, args=(gpu_id, model_idx_global, final_config, model_path))
+            p.start()
+            batch_processes.append(p)
+        
+        for p in batch_processes: p.join()
+        print(f"--- Finished training batch for models: {list(batch_indices)} ---")
+
+    print("\n===== Ensemble Training Finished =====")
+
+
+def run_ensemble_evaluation(args: argparse.Namespace):
+    """Loads and evaluates a trained ensemble."""
+    print("\n===== Evaluating Final Ensemble Model =====")
+    
+    dataset_main = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
+    final_config = load_best_config(args, dataset_main)
+    
+    all_checkpoint_paths = sorted([os.path.join(args.ensemble_dir, f) for f in os.listdir(args.ensemble_dir) if f.startswith('model_') and f.endswith('.pt')])
+    
+    if args.exclude:
+        print(f"Excluding model indices: {args.exclude}")
+        final_checkpoint_paths = [p for i, p in enumerate(all_checkpoint_paths) if i not in args.exclude]
+    else:
+        final_checkpoint_paths = all_checkpoint_paths
+
+    if not final_checkpoint_paths:
+        print("No models found to evaluate. Exiting.")
+        return
+
+    # Evaluation can be done on a single designated GPU
+    eval_device = f"cuda:{args.gpu_ids[0]}"
+    dataset_main.to(eval_device)
+
+    ensemble_model = EnsembleGNNRetrievalModel(
+        config=final_config,
+        data_config=get_data_configs(dataset_main),
+        checkpoint_paths=final_checkpoint_paths,
+        device=eval_device
+    )
+
+    metrics = ensemble_model.evaluate(
+        dataset=dataset_main,
+        split=args.split,
+        batch_size=final_config['evaluation']['batch_size']
+    )
+    
+    print(f"\n--- Final Ensemble Metrics on '{args.split}' split ---")
+    for key, value in metrics.items():
+        print(f"  {key}: {value:.4f}")
+    
+    print("\nEnsemble evaluation complete.")
+
+
+if __name__ == "__main__":
+    """
+    Main script for hyperparameter search, ensemble training, and evaluation.
+    
+    Usage:
+    
+    1. Perform Hyperparameter Search:
+       python your_script_name.py --search --n-trials 50 --gpu-ids 0 2 3
+    
+    2. Train the Final Ensemble using the best found parameters:
+       python your_script_name.py --train-ensemble --n-ensemble 6 --gpu-ids 0 2 3
+       
+    3. Evaluate the Trained Ensemble on the test set:
+       python your_script_name.py --evaluate-ensemble --gpu-ids 0
+       
+    4. Evaluate, but exclude models 1 and 4 from the ensemble:
+       python your_script_name.py --evaluate-ensemble --gpu-ids 0 --exclude 1 4
+    """
+    parser = argparse.ArgumentParser(description="GNN Retrieval Model Training and Evaluation")
+    
+    # Mode flags
+    parser.add_argument('--search', action='store_true', help='Run Optuna hyperparameter search.')
+    parser.add_argument('--train-ensemble', action='store_true', help='Train an ensemble of models using the best found config.')
+    parser.add_argument('--evaluate-ensemble', action='store_true', help='Evaluate a pre-trained ensemble of models.')
+    
+    # Common arguments
+    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0, 2, 3], help='List of GPU IDs to use.')
+    parser.add_argument('--db-path', type=str, default="optuna_study.db", help='Path to the Optuna SQLite database.')
+    parser.add_argument('--study-name', type=str, default="regularization-search", help='Name of the Optuna study.')
+    parser.add_argument('--ensemble-dir', type=str, default="ensemble_models", help='Directory to save/load ensemble models.')
+    
+    # Search-specific arguments
+    parser.add_argument('--n-trials', type=int, default=50, help='Number of trials for Optuna search.')
+    
+    # Training-specific arguments
+    parser.add_argument('--n-ensemble', type=int, default=6, help='Number of models in the ensemble.')
+    
+    # Evaluation-specific arguments
+    parser.add_argument('--exclude', type=int, nargs='*', help='List of model indices to exclude from the ensemble during evaluation.')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'], help='Data split to evaluate on.')
+
+    args = parser.parse_args()
+    
+    # Use the 'spawn' start method for CUDA safety in multiprocessing
     try:
-        best_trial = study.best_trial
-        print("\n--- Best Trial ---")
-        print(f"  Value (Best R@10): {best_trial.value:.6f}")
-        print("  Parameters:")
-        for key, value in best_trial.params.items():
-            print(f"    {key}: {value}")
-    except ValueError:
-        print("No trials were completed. Cannot show best trial.")
+        mp.set_start_method("spawn", force=True)
+        print("Using 'spawn' start method for CUDA compatibility.")
+    except RuntimeError:
+        print("Could not set 'spawn' start method again (this is OK).")
+
+    if args.search:
+        run_hyperparameter_search(args)
+    elif args.train_ensemble:
+        run_ensemble_training(args)
+    elif args.evaluate_ensemble:
+        run_ensemble_evaluation(args)
+    else:
+        print("Please specify a mode of operation.")
+        parser.print_help()
