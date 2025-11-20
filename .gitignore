@@ -174,3 +174,19 @@ scripts/analyze_gate_activation.sh
 scripts/run_gnn_workflow_flexible.sh
 scripts/run_gnn_workflow_testing_old.sh
 scripts/run_gnn_workflow.sh
+ensemble_models/
+ensemble_models_save/
+lightweight_graph/data_random_with_proof_instances/
+ensemble_models_random/
+data_analysis.py
+evaluation of layers.txt
+mathlib_map_cpu.png
+mathlib_skeleton.png
+mathlib_structural_node2vec.png
+dataset_analysis.ipynb
+commantstorun.txt
+minimal.py
+playground.py
+weight_norm.py
+wait_and_run.sh
+training_notes.txt

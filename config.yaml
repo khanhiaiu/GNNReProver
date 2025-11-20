@@ -1,0 +1,42 @@
+use_random_embeddings: true
+separate_premise_GNN: true
+use_ema: false
+
+undirected_premise_graph: false
+
+gnn:
+  hidden_size: 1024
+  n_layers: 2
+  layer_type: "RGCN"
+  n_relations: 3
+  heads: 4
+  normalization: "layernorm"
+  activation: "relu"
+  dropout: 0.1
+  edge_dropout: 0.1
+  residual: true
+
+loss:
+  weigh_by_class: true
+  loss_function: "bce"
+
+negative_sampler:
+  sampler: "random"
+  n_negatives_per_context: 3
+  scorer:
+    preprocess:
+      type: "none"
+    aggregation: "mean"
+    heads: 1
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 1.0e-5
+
+training:
+  epochs: 30
+  batch_size: 512
+  gradient_accumulation_steps: 1
+
+evaluation:
+  batch_size: 1024

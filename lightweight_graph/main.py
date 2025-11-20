@@ -11,7 +11,7 @@ def main() -> None:
     args = parser.parse_args()
 
     gnn_config = {
-        'mode': 'custom', 'use_proof_dependencies': False,
+        'mode': 'custom', 'use_proof_dependencies': True,
         'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
     }
 
