@@ -1,9 +1,13 @@
+# Combining Textual and Structural Information for Premise Selection in Lean
+
 This repository contains the official implementation of the paper **"Combining Textual and Structural Information for Premise Selection in Lean"**, accepted at the **NeurIPS 2025 Workshop on MATH-AI**.
 
 **Authors:** Job Petrovčič, David Narváez, Ljupčo Todorovski  
 *(University of Ljubljana, Jožef Stefan Institute)*
 
 [**Read the Paper on arXiv**](https://arxiv.org/abs/2510.23637)
+
+**Note:** This codebase is a modification of [LeanDojo](https://github.com/lean-dojo/LeanDojo).
 
 ## Overview
 
