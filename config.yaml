@@ -5,7 +5,7 @@ use_ema: false
 undirected_premise_graph: false
 
 gnn:
-  hidden_size: 1024
+  hidden_size: 512
   n_layers: 2
   layer_type: "RGCN"
   n_relations: 3

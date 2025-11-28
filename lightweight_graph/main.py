@@ -1,6 +1,6 @@
 import argparse
 from loguru import logger
-from dataset import LightweightGraphDataset
+from lightweight_graph.dataset import LightweightGraphDataset
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create or load the LightweightGraphDataset.")
@@ -11,8 +11,8 @@ def main() -> None:
     args = parser.parse_args()
 
     gnn_config = {
-        'mode': 'custom', 'use_proof_dependencies': True,
-        'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
+        'mode': 'custom', 'use_proof_dependencies': False,
+        'signature_and_state': {'verbosity': 'verbose', 'distinguish_lctx_goal': True}
     }
 
     dataset = LightweightGraphDataset.load_or_create(

@@ -510,13 +510,16 @@ class GNNRetrievalModel(Model):
 
         premise_edge_index = batch_data["premise_edge_index"]
         premise_edge_type = batch_data["premise_edge_type"]
-        if self.config["undirected_premise_graph"]:
+        if self.config["undirected_graphs"]:
             premise_edge_index, premise_edge_type = to_undirected(premise_edge_index, premise_edge_type)
 
         premise_to_context_edge_index = batch_data["premise_to_context_edge_index"].clone()
         assert premise_to_context_edge_index[1].max() <= n_contexts
         premise_to_context_edge_index[1] += n_premises 
         premise_to_context_edge_type = batch_data["premise_to_context_edge_type"]
+
+        if self.config["undirected_graphs"]:
+            premise_to_context_edge_index, premise_to_context_edge_type = to_undirected(premise_to_context_edge_index, premise_to_context_edge_type)
 
         all_edge_index = torch.cat([premise_edge_index, premise_to_context_edge_index], dim=1)
         all_edge_type = torch.cat([premise_edge_type, premise_to_context_edge_type], dim=0)
@@ -654,7 +657,7 @@ def get_data_config(dataset: LightweightGraphDataset) -> Dict[str, Any]:
     }
     return data_config
 
-SAVE_DIR = "lightweight_graph/data_random_updated"
+SAVE_DIR = "verbose"
 def load_dataset(save_dir: str=SAVE_DIR) -> LightweightGraphDataset:
     dataset = LightweightGraphDataset.load_or_create(save_dir=save_dir)
     return dataset
@@ -728,10 +731,10 @@ def objective(trial: optuna.Trial, base_config: Dict[str, Any], base_dataset: Li
     config["optimizer"]["lr"] = trial.suggest_float("lr", 0.000001, 0.01, log=True)
     config["optimizer"]["weight_decay"] = trial.suggest_float("weight_decay", 0.000001, 0.01, log=True)
     
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16, 128, 512, 1024])
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096])
     config["training"]["gradient_accumulation_steps"] = trial.suggest_categorical("gradient_accumulation_steps", [1, 2, 4])
 
-    config["undirected_premise_graph"] = trial.suggest_categorical("undirected_premise_graph", [True, False])
+    config["undirected_graphs"] = trial.suggest_categorical("undirected_graphs", [True])
     
     dataset = copy.deepcopy(base_dataset).to(device=f"cuda:{gpu_id}")
     try:
@@ -775,24 +778,30 @@ def optune(base_config: Dict[str, Any], base_dataset: LightweightGraphDataset, g
     mp_context = mp.get_context('spawn')
     executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context)
 
+    futures: Dict[Future[Any], Tuple[optuna.Trial, int]] = {}
+    for gpu_id in gpu_ids:
+        for _ in range(num_experiments_per_gpu):
+            trial = study.ask()
+            trial.set_user_attr("gpu_id", gpu_id)
+            # Pass save_dir instead of the heavy dataset object
+            future = executor.submit(objective, trial, base_config, base_dataset) 
+            futures[future] = (trial, gpu_id)
+        
     try:
-        while True:
-            futures_to_trial: Dict[Future[Any], optuna.Trial] = {}
-            for _ in range(num_experiments_per_gpu):
-                for gpu_id in gpu_ids:
-                    trial = study.ask()
-                    trial.set_user_attr("gpu_id", gpu_id)
-                    future = executor.submit(objective, trial, base_config, base_dataset)
-                    futures_to_trial[future] = trial
-            
-            for future in as_completed(futures_to_trial):
-                trial = futures_to_trial[future]
-                try:
-                    result = future.result()
-                    study.tell(trial, result)
-                except Exception as e:
-                    logger.error(f"Error occurred for trial {trial.number}: {e}", exc_info=True)
-                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+        for future in as_completed(futures):
+            trial, gpu_id = futures.pop(future)
+            try:
+                result = future.result()
+                study.tell(trial, result)
+            except Exception as e:
+                logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+            # Submit a new trial to the FREED gpu_id
+            new_trial = study.ask()
+            new_trial.set_user_attr("gpu_id", gpu_id)
+            new_future = executor.submit(objective, new_trial, base_config, base_dataset)
+            futures[new_future] = (new_trial, gpu_id)
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received. Terminating all running trials...")
@@ -807,7 +816,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     dataset = load_dataset()
-    config = load_config("config.yaml")
-    config["data_config"] = get_data_config(dataset)
-    study_name = "random_embedding_study"
-    optune(config, dataset, gpu_ids=[1, 2, 3], storage=f"sqlite:///{study_name}.db", study_name=study_name)
+    #import code; code.interact(local=dict(globals(), **locals()))
+    #config = load_config("config.yaml")
+    #config["data_config"] = get_data_config(dataset)
+    #study_name = "undirected_study_v3"
+    #optune(config, dataset, gpu_ids=[1, 2, 3], storage=f"sqlite:///{study_name}.db", study_name=study_name)

@@ -1087,6 +1087,11 @@ def load_best_config(args: argparse.Namespace, dataset: LightweightGraphDataset)
     best_params = FIXED_PARAMS.copy()
     best_params.update(best_trial.params)
     
+    # Override n_layers if the command-line argument is provided
+    if args.n_layers is not None:
+        print(f"\n[INFO] Overriding 'n_layers' from FIXED_PARAMS with command-line value: {args.n_layers}")
+        best_params['n_layers'] = args.n_layers
+
     final_config = create_config_from_params(best_params, n_relations, data_config)
 
     print("\n--- Full Model Configuration Being Used ---")
@@ -1139,14 +1144,25 @@ def run_ensemble_training(args: argparse.Namespace):
     dataset_main = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
     final_config = load_best_config(args, dataset_main)
     
-    os.makedirs(args.ensemble_dir, exist_ok=True)
+    # <<< MODIFICATION START >>>
+    # Construct the actual directory where models will be saved
+    current_ensemble_dir = args.ensemble_dir
+    if args.model_id:
+        current_ensemble_dir = os.path.join(args.ensemble_dir, args.model_id)
+        print(f"[INFO] Using model-id '{args.model_id}'. Models will be saved in '{current_ensemble_dir}/'")
+    else:
+        print(f"[WARNING] No --model-id provided. Models will be saved in the default directory: '{current_ensemble_dir}/'")
+
+    os.makedirs(current_ensemble_dir, exist_ok=True) # Ensure the directory exists
     print(f"\nTraining an ensemble of {args.n_ensemble} models using the best hyperparameters.")
     if args.use_ema:
         print(f"EMA is ENABLED with a decay of {args.ema_decay}.")
-    print(f"Models will be saved in '{args.ensemble_dir}/'")
+    print(f"Models will be saved in '{current_ensemble_dir}/'") # Updated message
 
     n_jobs = len(args.gpu_ids)
-    checkpoint_paths = [os.path.join(args.ensemble_dir, f"model_{i}.pt") for i in range(args.n_ensemble)]
+    # Checkpoint paths are now relative to current_ensemble_dir
+    checkpoint_paths = [os.path.join(current_ensemble_dir, f"model_{i}.pt") for i in range(args.n_ensemble)]
+    # <<< MODIFICATION END >>>
 
     # Iterate in chunks of size n_jobs to train one model per GPU at a time
     for i in range(0, args.n_ensemble, n_jobs):
@@ -1177,9 +1193,22 @@ def run_ensemble_evaluation(args: argparse.Namespace):
     dataset_main = LightweightGraphDataset.load_or_create(save_dir=SAVE_DIR)
     final_config = load_best_config(args, dataset_main)
     
-    # Logic to select which model files to load
-    print(f"Searching for models in '{args.ensemble_dir}'...")
-    all_files = sorted([f for f in os.listdir(args.ensemble_dir) if f.startswith('model_') and f.endswith('.pt')])
+    # <<< MODIFICATION START >>>
+    # Construct the actual directory from where models will be loaded
+    current_ensemble_dir = args.ensemble_dir
+    if args.model_id:
+        current_ensemble_dir = os.path.join(args.ensemble_dir, args.model_id)
+        print(f"[INFO] Using model-id '{args.model_id}'. Models will be loaded from '{current_ensemble_dir}/'")
+    else:
+        print(f"[WARNING] No --model-id provided. Models will be loaded from the default directory: '{current_ensemble_dir}/'")
+
+    print(f"Searching for models in '{current_ensemble_dir}'...")
+    if not os.path.exists(current_ensemble_dir):
+        print(f"Error: Ensemble directory '{current_ensemble_dir}' does not exist. Cannot evaluate.")
+        return
+
+    all_files = sorted([f for f in os.listdir(current_ensemble_dir) if f.startswith('model_') and f.endswith('.pt')])
+    # <<< MODIFICATION END >>>
     
     if args.model_type == 'ema':
         print("Selecting EMA models for evaluation (files ending in '_ema.pt').")
@@ -1188,7 +1217,9 @@ def run_ensemble_evaluation(args: argparse.Namespace):
         print("Selecting REGULAR models for evaluation (files NOT ending in '_ema.pt').")
         model_files = [f for f in all_files if not f.endswith('_ema.pt')]
         
-    all_checkpoint_paths = [os.path.join(args.ensemble_dir, f) for f in model_files]
+    # <<< MODIFICATION START >>>
+    all_checkpoint_paths = [os.path.join(current_ensemble_dir, f) for f in model_files]
+    # <<< MODIFICATION END >>>
     
     if args.exclude:
         print(f"Excluding model indices: {args.exclude}")
@@ -1197,7 +1228,7 @@ def run_ensemble_evaluation(args: argparse.Namespace):
         final_checkpoint_paths = all_checkpoint_paths
 
     if not final_checkpoint_paths:
-        print(f"No '{args.model_type}' models found to evaluate. Exiting.")
+        print(f"No '{args.model_type}' models found to evaluate in '{current_ensemble_dir}'. Exiting.")
         return
 
     # Evaluation can be done on a single designated GPU
@@ -1242,6 +1273,7 @@ if __name__ == "__main__":
     4. Evaluate the Trained EMA Ensemble on the test set:
        python your_script_name.py --evaluate-ensemble --gpu-ids 0 --model-type ema
     """
+    print(f"Using dataset in {SAVE_DIR}")
     parser = argparse.ArgumentParser(description="GNN Retrieval Model Training and Evaluation")
     
     # Mode flags
@@ -1262,11 +1294,18 @@ if __name__ == "__main__":
     parser.add_argument('--n-ensemble', type=int, default=6, help='Number of models in the ensemble.')
     parser.add_argument('--use-ema', action='store_true', help='Use Exponential Moving Average during ensemble training.')
     parser.add_argument('--ema-decay', type=float, default=0.999, help='Decay rate for EMA.')
+    parser.add_argument('--n-layers', type=int, default=None, help='Override the number of GNN layers from FIXED_PARAMS for training/evaluation.')
+    # <<< MODIFICATION START >>>
+    parser.add_argument('--model-id', type=str, default=None,
+                        help='Optional identifier for the ensemble model directory to prevent overwriting '
+                             '(e.g., "n_layers_1" will save/load from ensemble_models/n_layers_1/).')
+    # <<< MODIFICATION END >>>
 
     # Evaluation-specific arguments
     parser.add_argument('--exclude', type=int, nargs='*', help='List of model indices to exclude from the ensemble during evaluation.')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'], help='Data split to evaluate on.')
     parser.add_argument('--model-type', type=str, default='regular', choices=['regular', 'ema'], help='Which type of models to evaluate from the ensemble directory.')
+    parser.add_argument('--eval-batch-size', type=int, default=None, help='Batch size for evaluation (overrides config default).')
 
     args = parser.parse_args()
     
