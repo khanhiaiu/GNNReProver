@@ -7,7 +7,7 @@ This repository contains the official implementation of the paper **"Combining T
 
 [**Read the Paper on arXiv**](https://arxiv.org/abs/2510.23637)
 
-**Note:** This codebase is a modification of [LeanDojo](https://github.com/lean-dojo/LeanDojo).
+**Note:** This codebase is a modification of [LeanDojo's ReProver](https://github.com/lean-dojo/ReProver).
 
 ## Overview
 
