@@ -1,0 +1,33 @@
+# Core AI and GNN Libraries
+torch>=2.1.0
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+pytorch-lightning>=2.0.0
+torchmetrics
+transformers
+deepspeed>=0.10.0
+rank-bm25
+# Lean Proof Environment
+lean-dojo>=1.0.0
+# Hyperparameter Tuning
+optuna
+# Numerical and Data Processing
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<1.13.0
+pandas
+networkx
+scikit-learn
+# Visualization
+matplotlib
+seaborn
+# Utilities
+loguru
+PyYAML
+tqdm
+fsspec
+aiohttp
+requests
+ray
