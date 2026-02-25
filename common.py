@@ -16,9 +16,15 @@ from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict,
 )
 from transformers import get_constant_schedule_with_warmup
-from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+try:
+    from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+    from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
+    DEEPSPEED_AVAILABLE = True
+except (ImportError, Exception):
+    DEEPSPEED_AVAILABLE = False
+    FusedAdam = DeepSpeedCPUAdam = DeepSpeedStrategy = None
+
 from typing import Optional, List, Dict, Any, Tuple, Generator
-from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
 from tqdm import tqdm
 
 
@@ -500,7 +506,7 @@ def get_optimizers(
     """Return an AdamW optimizer with cosine warmup learning rate schedule."""
     strategy = trainer.strategy
 
-    if isinstance(strategy, DeepSpeedStrategy):
+    if DEEPSPEED_AVAILABLE and isinstance(strategy, DeepSpeedStrategy):
         if "offload_optimizer" in strategy.config["zero_optimization"]:
             logger.info("Optimizing with DeepSpeedCPUAdam")
             optimizer = DeepSpeedCPUAdam(
@@ -567,7 +573,8 @@ def cpu_checkpointing_enabled(pl_module) -> bool:
     try:
         trainer = pl_module.trainer
         return (
-            trainer.strategy is not None
+            DEEPSPEED_AVAILABLE
+            and trainer.strategy is not None
             and isinstance(trainer.strategy, DeepSpeedStrategy)
             and trainer.strategy.config["activation_checkpointing"]["cpu_checkpointing"]
         )
